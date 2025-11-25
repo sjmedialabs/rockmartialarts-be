@@ -1,0 +1,51 @@
+nohup: ignoring input
+INFO:     Started server process [4092065]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:3021 (Press CTRL+C to quit)
+🔑 auth.py using SECRET_KEY: student_management_s...
+🔑 unified_auth.py using SECRET_KEY: student_management_s...
+INFO:     106.222.234.79:15477 - "GET / HTTP/1.1" 200 OK
+INFO:     106.222.234.79:15477 - "GET /favicon.ico HTTP/1.1" 405 Method Not Allowed
+INFO:     106.222.234.79:15477 - "GET / HTTP/1.1" 200 OK
+INFO:     106.222.234.79:15477 - "GET /favicon.ico HTTP/1.1" 405 Method Not Allowed
+WARNING:passlib.handlers.bcrypt:(trapped) error reading bcrypt version
+Traceback (most recent call last):
+  File "/www/wwwroot/rockmartialarts-be/venv/lib/python3.12/site-packages/passlib/handlers/bcrypt.py", line 620, in _load_backend_mixin
+    version = _bcrypt.__about__.__version__
+              ^^^^^^^^^^^^^^^^^
+AttributeError: module 'bcrypt' has no attribute '__about__'
+INFO:     106.222.234.79:14036 - "POST /api/superadmin/login HTTP/1.1" 200 OK
+INFO:     106.222.234.79:29241 - "OPTIONS /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:4733 - "OPTIONS /api/coaches?limit=5&active_only=true HTTP/1.1" 200 OK
+INFO:     106.222.234.79:22120 - "OPTIONS /api/payments/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:25017 - "OPTIONS /api/dashboard/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23404 - "OPTIONS /api/payments?limit=5&skip=0 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23375 - "OPTIONS /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:29241 - "OPTIONS /api/dashboard/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:4733 - "OPTIONS /api/coaches?limit=5&active_only=true HTTP/1.1" 200 OK
+INFO:     106.222.234.79:22120 - "OPTIONS /api/payments?limit=5&skip=0 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:25017 - "OPTIONS /api/payments/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23404 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+🔍 Payment query debug - Student ID: N/A
+🔍 Total payments found: 2, After deduplication: 2
+INFO:     106.222.234.79:25017 - "GET /api/payments?limit=5&skip=0 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:4733 - "GET /api/payments/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23375 - "GET /api/coaches?limit=5&active_only=true HTTP/1.1" 200 OK
+🔍 Payment query debug - Student ID: N/A
+🔍 Total payments found: 2, After deduplication: 2
+INFO:     106.222.234.79:25017 - "GET /api/payments?limit=5&skip=0 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23404 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:23375 - "GET /api/coaches?limit=5&active_only=true HTTP/1.1" 200 OK
+INFO:     106.222.234.79:4733 - "GET /api/payments/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:29241 - "GET /api/dashboard/stats HTTP/1.1" 200 OK
+INFO:     106.222.234.79:29241 - "GET /api/dashboard/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59544 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     106.222.234.79:18055 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:2136 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:20810 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:15016 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:11221 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:24314 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:8640 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
+INFO:     106.222.234.79:32336 - "GET /api/messages/notifications?skip=0&limit=20 HTTP/1.1" 200 OK
