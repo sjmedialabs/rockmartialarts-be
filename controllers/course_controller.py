@@ -287,6 +287,58 @@ class CourseController:
         if not update_data:
             raise HTTPException(status_code=400, detail="No update data provided")
 
+        # When pricing is updated, set base_fee / fee_per_duration / branch_pricing for payment API
+        if "pricing" in update_data:
+            p = update_data["pricing"]
+            if isinstance(p, dict):
+                base_fee = p.get("fee_1_month") if p.get("fee_1_month") is not None else p.get("amount")
+                if base_fee is not None:
+                    update_data["base_fee"] = float(base_fee)
+                # Support fee_per_duration keyed by duration id (from master data) or legacy keys
+                fee_per_duration = {}
+                if p.get("fee_per_duration") and isinstance(p.get("fee_per_duration"), dict):
+                    for k, v in p["fee_per_duration"].items():
+                        if v is not None:
+                            try:
+                                fee_per_duration[str(k)] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                if not fee_per_duration:
+                    for key, attr in [("1-month", "fee_1_month"), ("3-months", "fee_3_months"), ("6-months", "fee_6_months"), ("1-year", "fee_1_year")]:
+                        if p.get(attr) is not None:
+                            fee_per_duration[key] = float(p[attr])
+                if fee_per_duration:
+                    update_data["fee_per_duration"] = fee_per_duration
+                branch_prices = p.get("branch_prices") or []
+                if branch_prices:
+                    branch_pricing = {}
+                    for bp in branch_prices:
+                        bid = bp.get("branch_id") if isinstance(bp, dict) else getattr(bp, "branch_id", None)
+                        if not bid:
+                            continue
+                        bp_fee_per_duration = bp.get("fee_per_duration") if isinstance(bp, dict) else getattr(bp, "fee_per_duration", None)
+                        if bp_fee_per_duration and isinstance(bp_fee_per_duration, dict):
+                            try:
+                                branch_pricing[bid] = {str(k): float(v) for k, v in bp_fee_per_duration.items() if v is not None}
+                            except (TypeError, ValueError):
+                                pass
+                        has_duration_fees = not branch_pricing.get(bid) and any(
+                            (bp.get(attr) if isinstance(bp, dict) else getattr(bp, attr, None)) is not None
+                            for attr in ("fee_1_month", "fee_3_months", "fee_6_months", "fee_1_year")
+                        )
+                        if not branch_pricing.get(bid) and has_duration_fees:
+                            branch_pricing[bid] = {}
+                            for key, attr in [("1-month", "fee_1_month"), ("3-months", "fee_3_months"), ("6-months", "fee_6_months"), ("1-year", "fee_1_year")]:
+                                val = bp.get(attr) if isinstance(bp, dict) else getattr(bp, attr, None)
+                                if val is not None:
+                                    branch_pricing[bid][key] = float(val)
+                        elif not branch_pricing.get(bid):
+                            amt = bp.get("amount") if isinstance(bp, dict) else getattr(bp, "amount", None)
+                            if amt is not None:
+                                branch_pricing[bid] = float(amt)
+                    if branch_pricing:
+                        update_data["branch_pricing"] = branch_pricing
+
         update_data["updated_at"] = datetime.utcnow()
         
         result = await db.courses.update_one(

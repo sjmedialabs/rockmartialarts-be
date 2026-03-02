@@ -380,11 +380,9 @@ class AuthController:
         if not user:
             raise HTTPException(status_code=404, detail="Student not found")
 
-        # Get enrollment information
-        enrollments = await db.enrollments.find({
-            "student_id": current_user["id"],
-            "is_active": True
-        }).to_list(100)
+        # Get enrollment information (all enrollments so we can show expiry date when inactive)
+        enrollments_cursor = db.enrollments.find({"student_id": current_user["id"]}).sort("end_date", -1)
+        enrollments = await enrollments_cursor.to_list(100)
 
         # Enrich enrollment data with course and branch details
         enriched_enrollments = []

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, status, Query
 from typing import Optional
 from controllers.payment_controller import PaymentController
-from models.student_models import StudentPaymentCreate
+from models.student_models import StudentPaymentCreate, ConfirmRazorpayPayment
 from models.payment_models import RegistrationPaymentCreate
 from models.user_models import UserRole
 from utils.auth import require_role
@@ -15,6 +15,15 @@ async def student_process_payment(
     current_user: dict = Depends(require_role([UserRole.STUDENT]))
 ):
     return await PaymentController.student_process_payment(payment_data, current_user)
+
+
+@router.post("/confirm-razorpay", status_code=status.HTTP_200_OK)
+async def confirm_razorpay_payment(
+    data: ConfirmRazorpayPayment,
+    current_user: dict = Depends(require_role([UserRole.STUDENT]))
+):
+    """Record Razorpay payment and update enrollment (student-only)."""
+    return await PaymentController.confirm_razorpay_payment(data, current_user)
 
 @router.post("/process-registration", status_code=status.HTTP_201_CREATED)
 async def process_registration_payment(payment_data: RegistrationPaymentCreate):

@@ -15,6 +15,18 @@ class StudentPaymentCreate(BaseModel):
     transaction_id: str = None
     notes: str = None
 
+
+class ConfirmRazorpayPayment(BaseModel):
+    """Payload from frontend after Razorpay success to record payment and update enrollment."""
+    enrollment_id: str
+    amount: float
+    razorpay_payment_id: str
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
+    duration_months: Optional[int] = None  # for renewal: extend end_date by this many months
+    course_name: Optional[str] = None
+    branch_name: Optional[str] = None
+
 # New models for registration payment flow
 class StudentRegistrationPayment(BaseModel):
     student_id: str

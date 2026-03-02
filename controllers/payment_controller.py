@@ -7,7 +7,7 @@ import io
 from typing import Optional
 
 from models.payment_models import PaymentStatus, PaymentType, PaymentMethod, Payment, RegistrationPaymentCreate, RegistrationPaymentResponse
-from models.student_models import StudentPaymentCreate, CoursePaymentInfo
+from models.student_models import StudentPaymentCreate, CoursePaymentInfo, ConfirmRazorpayPayment
 from models.user_models import UserRole, UserCreate
 from models.notification_models import PaymentNotification, PaymentNotificationCreate
 from utils.auth import require_role
@@ -72,6 +72,63 @@ class PaymentController:
         return {"message": "Payment processed successfully", "payment_id": pending_payment["id"]}
 
     @staticmethod
+    async def confirm_razorpay_payment(
+        data: ConfirmRazorpayPayment,
+        current_user: dict = Depends(require_role([UserRole.STUDENT]))
+    ):
+        """Record a Razorpay payment and update enrollment (payment_status, end_date if renewal)."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        student_id = current_user["id"]
+
+        enrollment = await db.enrollments.find_one({
+            "id": data.enrollment_id,
+            "student_id": student_id,
+        })
+        if not enrollment:
+            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
+
+        now = datetime.utcnow()
+        due_date = now + timedelta(days=30)
+
+        payment_doc = {
+            "id": str(uuid.uuid4()),
+            "student_id": student_id,
+            "enrollment_id": data.enrollment_id,
+            "amount": data.amount,
+            "payment_type": PaymentType.COURSE_FEE.value,
+            "payment_method": PaymentMethod.DIGITAL_WALLET.value,
+            "payment_status": PaymentStatus.PAID.value,
+            "transaction_id": data.razorpay_payment_id,
+            "payment_date": now,
+            "due_date": due_date,
+            "notes": f"Razorpay order: {data.razorpay_order_id or 'N/A'}",
+            "course_details": {"course_name": data.course_name} if data.course_name else None,
+            "branch_details": {"branch_name": data.branch_name} if data.branch_name else None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        await db.payments.insert_one(payment_doc)
+
+        update_enrollment = {"payment_status": PaymentStatus.PAID.value, "updated_at": now}
+        if data.duration_months and enrollment.get("end_date"):
+            try:
+                end = enrollment["end_date"]
+                new_end = end + timedelta(days=30 * data.duration_months)
+                update_enrollment["end_date"] = new_end
+            except Exception:
+                pass
+
+        await db.enrollments.update_one(
+            {"id": data.enrollment_id},
+            {"$set": update_enrollment},
+        )
+
+        return {"message": "Payment recorded successfully", "payment_id": payment_doc["id"]}
+
+    @staticmethod
     async def get_course_payment_info(course_id: str, branch_id: str, duration: str):
         """Get payment information for a course"""
         try:
@@ -101,22 +158,64 @@ class PaymentController:
 
             pricing_multiplier = duration_info.get("pricing_multiplier", 1.0) if duration_info else 1.0
             duration_name = duration_info.get("name", duration) if duration_info else duration
-
-            # Calculate pricing - handle different pricing structures
-            base_price = 15000  # Default base price
-            if course.get("pricing"):
-                if isinstance(course["pricing"], dict):
-                    base_price = course["pricing"].get("amount", base_price)
-                elif isinstance(course["pricing"], (int, float)):
-                    base_price = course["pricing"]
-            elif course.get("price"):
-                base_price = course["price"]
-            elif course.get("fee"):
-                base_price = course["fee"]
-
-            course_fee = float(base_price) * pricing_multiplier
             admission_fee = 500.0  # Fixed admission fee
-            total_amount = course_fee + admission_fee
+            course_fee = None
+            total_amount = None
+
+            # 1) Branch-specific duration fees (object with "1-month", "3-months", etc.)
+            branch_pricing = course.get("branch_pricing") or {}
+            bp_val = None
+            if branch_id in branch_pricing:
+                bp_val = branch_pricing[branch_id]
+                if isinstance(bp_val, dict) and duration in bp_val and bp_val[duration] is not None:
+                    course_fee = float(bp_val[duration])
+                    total_amount = course_fee + admission_fee
+                    pricing_multiplier = 1.0
+                elif isinstance(bp_val, dict) and bp_val:
+                    # Branch has tenure-specific fees but this duration was not added
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Fee not configured for duration '{duration}' at this branch."
+                    )
+                elif isinstance(bp_val, (int, float)):
+                    base_price = float(bp_val)
+                    course_fee = base_price * pricing_multiplier
+                    total_amount = course_fee + admission_fee
+                else:
+                    bp_val = None
+
+            if total_amount is None:
+                # 2) Default fee_per_duration (only tenures added in course add/edit)
+                fee_per_duration = course.get("fee_per_duration") or {}
+                if duration in fee_per_duration and fee_per_duration[duration] is not None:
+                    course_fee = float(fee_per_duration[duration])
+                    total_amount = course_fee + admission_fee
+                    pricing_multiplier = 1.0
+                elif fee_per_duration:
+                    # Tenures are configured but this duration was not added – do not return a price
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Fee not configured for duration '{duration}'. Only added tenures are available."
+                    )
+                else:
+                    # 3) Legacy: no fee_per_duration, use base_fee * multiplier
+                    base_price = course.get("base_fee")
+                    if base_price is None:
+                        if course.get("pricing"):
+                            pr = course["pricing"]
+                            if isinstance(pr, dict):
+                                base_price = pr.get("fee_1_month") or pr.get("amount")
+                            elif isinstance(pr, (int, float)):
+                                base_price = pr
+                        if base_price is None:
+                            base_price = course.get("price") or course.get("fee")
+                    if base_price is None:
+                        base_price = 15000
+                    base_price = float(base_price)
+                    if branch_id in branch_pricing and isinstance(branch_pricing[branch_id], (int, float)):
+                        base_price = float(branch_pricing[branch_id])
+                    course_fee = base_price * pricing_multiplier
+                    total_amount = course_fee + admission_fee
 
             # Import PaymentCalculation
             from models.student_models import PaymentCalculation
