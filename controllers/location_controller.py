@@ -342,6 +342,62 @@ class LocationController:
         # Get total count
         total = await db.locations.count_documents(query)
 
+        # Fallback: if no locations in DB (e.g. not yet configured), derive from active branches
+        # so the edit-student Location dropdown still has options
+        if not locations:
+            branch_query = {"is_active": True} if active_only else {}
+            all_branches = await db.branches.find(branch_query).to_list(500)
+            # Group by location_id and build synthetic location entries
+            by_loc: dict = {}
+            for branch in all_branches:
+                loc_id = branch.get("location_id")
+                if not loc_id:
+                    continue
+                binfo = branch.get("branch") or {}
+                addr = binfo.get("address") or {}
+                state = addr.get("state") or addr.get("city") or loc_id
+                if loc_id not in by_loc:
+                    by_loc[loc_id] = {"id": loc_id, "name": state, "code": (state[:3].upper() if state else loc_id[:3]), "state": state, "country": addr.get("country", ""), "branches_list": []}
+                branch_data = {
+                    "id": branch["id"],
+                    "name": binfo.get("name", ""),
+                    "code": binfo.get("code", ""),
+                    "email": binfo.get("email", ""),
+                    "phone": binfo.get("phone", ""),
+                    "address": {
+                        "line1": addr.get("line1", ""),
+                        "area": addr.get("area", ""),
+                        "city": addr.get("city", ""),
+                        "state": addr.get("state", ""),
+                        "pincode": addr.get("pincode", ""),
+                        "country": addr.get("country", ""),
+                    },
+                    "courses_offered": (branch.get("operational_details") or {}).get("courses_offered", []),
+                    "course_count": len(branch.get("assignments", {}).get("courses", []) or []),
+                    "timings": (branch.get("operational_details") or {}).get("timings", []),
+                }
+                by_loc[loc_id]["branches_list"].append(branch_data)
+            enriched_locations = [
+                {
+                    "id": loc["id"],
+                    "name": loc["name"],
+                    "code": loc["code"],
+                    "state": loc["state"],
+                    "country": loc["country"],
+                    "timezone": "",
+                    "branch_count": len(loc["branches_list"]),
+                    "branches": loc["branches_list"] if include_branches else [],
+                    "total_courses_available": sum(b.get("course_count", 0) for b in loc["branches_list"]),
+                }
+                for loc in by_loc.values()
+            ]
+            total = len(enriched_locations)
+            return {
+                "message": f"Retrieved {len(enriched_locations)} locations (from branches) successfully",
+                "locations": enriched_locations,
+                "total": total
+            }
+
         # Enrich locations with branch and course data
         enriched_locations = []
         for location in locations:
@@ -416,36 +472,39 @@ class LocationController:
         skip: int = 0,
         limit: int = 50
     ):
-        """Get branches filtered by location - Public endpoint"""
+        """Get branches filtered by location - Public endpoint. Works for both DB locations and synthetic location_id (from branches)."""
         db = get_db()
 
-        # Verify location exists
+        # Find location in DB (may be missing when locations are derived from branches)
         location = await db.locations.find_one({"id": location_id})
-        if not location:
-            raise HTTPException(status_code=404, detail="Location not found")
 
-        # Find branches in this location using location_id
-        branch_query = {
-            "location_id": location_id
-        }
+        branch_query = {"location_id": location_id}
         if active_only:
             branch_query["is_active"] = True
 
-        # Apply pagination
         if limit > 100:
             limit = 100
 
-        # Get branches
         branches_cursor = db.branches.find(branch_query).skip(skip).limit(limit)
         branches = await branches_cursor.to_list(limit)
-
-        # Get total count
         total = await db.branches.count_documents(branch_query)
+
+        if not branches:
+            raise HTTPException(status_code=404, detail="No branches found for this location")
+
+        # Synthetic location when not in DB (e.g. from get_locations_with_details fallback)
+        if not location:
+            addr = branches[0].get("branch", {}).get("address", {}) or {}
+            location = {
+                "id": location_id,
+                "name": addr.get("state") or addr.get("city") or location_id,
+                "code": (addr.get("state") or location_id)[:3].upper(),
+                "state": addr.get("state") or "",
+            }
 
         # Enrich branches with course data
         enriched_branches = []
         for branch in branches:
-            # Get available courses if requested
             available_courses = []
             if include_courses:
                 course_ids = branch.get("assignments", {}).get("courses", [])
@@ -456,9 +515,7 @@ class LocationController:
                     }).to_list(100)
 
                     for course in courses:
-                        # Get category info
                         category = await db.categories.find_one({"id": course["category_id"]})
-
                         course_data = {
                             "id": course["id"],
                             "title": course["title"],
@@ -472,39 +529,37 @@ class LocationController:
                         }
                         available_courses.append(course_data)
 
-            # Get timings if requested
             timings = []
             if include_timings:
-                timings = branch["operational_details"]["timings"]
+                timings = branch.get("operational_details", {}).get("timings", [])
 
             branch_data = {
                 "id": branch["id"],
                 "name": branch["branch"]["name"],
-                "code": branch["branch"]["code"],
-                "email": branch["branch"]["email"],
-                "phone": branch["branch"]["phone"],
+                "code": branch["branch"].get("code", ""),
+                "email": branch["branch"].get("email", ""),
+                "phone": branch["branch"].get("phone", ""),
                 "address": {
-                    "line1": branch["branch"]["address"]["line1"],
-                    "area": branch["branch"]["address"]["area"],
-                    "city": branch["branch"]["address"]["city"],
-                    "state": branch["branch"]["address"]["state"],
-                    "pincode": branch["branch"]["address"]["pincode"],
-                    "country": branch["branch"]["address"]["country"]
+                    "line1": branch["branch"]["address"].get("line1", ""),
+                    "area": branch["branch"]["address"].get("area", ""),
+                    "city": branch["branch"]["address"].get("city", ""),
+                    "state": branch["branch"]["address"].get("state", ""),
+                    "pincode": branch["branch"]["address"].get("pincode", ""),
+                    "country": branch["branch"]["address"].get("country", "")
                 },
                 "available_courses": available_courses,
                 "timings": timings,
                 "course_count": len(available_courses)
             }
-
             enriched_branches.append(branch_data)
 
         return {
             "message": f"Retrieved {len(enriched_branches)} branches for location successfully",
             "location": {
                 "id": location["id"],
-                "name": location["name"],
-                "code": location["code"],
-                "state": location["state"]
+                "name": location.get("name", ""),
+                "code": location.get("code", ""),
+                "state": location.get("state", "")
             },
             "branches": enriched_branches,
             "total": total

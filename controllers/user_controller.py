@@ -104,6 +104,11 @@ class UserController:
             if not user_dict.get("branch_id"):
                 user_dict["branch_id"] = user_data.branch.branch_id
 
+        if user_data.address is not None:
+            user_dict["address"] = user_data.address
+        if user_data.emergency_contact is not None:
+            user_dict["emergency_contact"] = user_data.emergency_contact
+
         await db.users.insert_one(user_dict)
 
         # Create enrollment record if course information is provided (for students)
@@ -185,6 +190,25 @@ class UserController:
             if current_user.get("branch_id"):
                 filter_query["branch_id"] = current_user["branch_id"]
             filter_query["role"] = UserRole.STUDENT.value  # Only show students to coaches
+        elif current_role == UserRole.BRANCH_MANAGER:
+            # Branch managers see only students enrolled in their managed branches
+            branch_manager_id = current_user.get("id")
+            if branch_manager_id:
+                managed_branches = await get_db().branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
+                managed_branch_ids = [b["id"] for b in managed_branches]
+                if not managed_branch_ids:
+                    # No branches assigned: return empty list
+                    filter_query["id"] = {"$in": []}
+                else:
+                    enrollments = await get_db().enrollments.find({"branch_id": {"$in": managed_branch_ids}, "is_active": True}).to_list(length=5000)
+                    student_ids = list(set(e["student_id"] for e in enrollments))
+                    if not student_ids:
+                        filter_query["id"] = {"$in": []}
+                    else:
+                        filter_query["id"] = {"$in": student_ids}
+                    filter_query["role"] = UserRole.STUDENT.value
+            else:
+                filter_query["id"] = {"$in": []}
         
         # Apply additional filters
         if role:
@@ -493,11 +517,13 @@ class UserController:
                 # Handle nested branch object (v could be dict or BranchInfo object)
                 if isinstance(v, dict):
                     update_data["branch"] = v
+                    update_data["branch_id"] = v.get("branch_id")  # Top-level for querying/display
                 else:
                     update_data["branch"] = {
                         "location_id": v.location_id,
                         "branch_id": v.branch_id
                     }
+                    update_data["branch_id"] = v.branch_id  # Top-level for querying/display
             elif k in ["course_category_id", "course_id", "course_duration", "location_id"]:
                 # Handle flat fields for backward compatibility
                 # Convert flat fields to nested structure
@@ -730,17 +756,16 @@ class UserController:
 
     @staticmethod
     async def get_student_details(
-        current_user: dict = Depends(get_current_user_or_superadmin)
+        current_user: dict,
+        unassigned_only: bool = False
     ):
-        """Get detailed student information with course enrollment data (Authenticated endpoint)"""
+        """Get detailed student information with course enrollment data (Authenticated endpoint).
+        When unassigned_only=True, returns only students with no active branch enrollment (for Assign to Branch modal)."""
 
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
-
-        # Build query based on user role
-        query = {"role": "student", "is_active": True}
 
         # Role-based access control
         current_role = current_user.get("role")
@@ -749,6 +774,60 @@ class UserController:
                 current_role = UserRole(current_role)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid user role")
+
+        # Unassigned-only: students with no active enrollment in any branch (for Assign to Branch dropdown)
+        if unassigned_only:
+            if current_role not in (UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER):
+                return {"message": "No students found", "students": [], "total": 0}
+            assigned_student_ids = await db.enrollments.distinct("student_id", {"is_active": True})
+            query = {"role": "student", "is_active": True, "id": {"$nin": assigned_student_ids}}
+            students_cursor = db.users.find(query)
+            students = await students_cursor.to_list(1000)
+            if not students:
+                return {"message": "No unassigned students found", "students": [], "total": 0}
+            # Enrich minimally for dropdown (id, full_name, email, etc.)
+            enriched_students = []
+            for student in students:
+                student_id = student["id"]
+                age = None
+                if student.get("date_of_birth"):
+                    if isinstance(student["date_of_birth"], str):
+                        try:
+                            birth_date = datetime.strptime(student["date_of_birth"], "%Y-%m-%d").date()
+                        except ValueError:
+                            birth_date = None
+                    elif isinstance(student["date_of_birth"], date):
+                        birth_date = student["date_of_birth"]
+                    else:
+                        birth_date = None
+                    if birth_date:
+                        today = date.today()
+                        age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+                full_name = student.get("full_name", f"{student.get('first_name', '')} {student.get('last_name', '')}".strip())
+                enriched_students.append({
+                    "id": student_id,
+                    "student_id": student_id,
+                    "full_name": full_name or "Unknown",
+                    "student_name": full_name or "Unknown",
+                    "first_name": student.get("first_name", ""),
+                    "last_name": student.get("last_name", ""),
+                    "email": student.get("email"),
+                    "phone": student.get("phone"),
+                    "role": student.get("role", "student"),
+                    "gender": student.get("gender", "Not specified"),
+                    "age": age,
+                    "date_of_birth": student.get("date_of_birth"),
+                    "is_active": student.get("is_active", True),
+                    "created_at": student.get("created_at"),
+                    "branch_id": None,
+                    "branch_info": None,
+                    "courses": [],
+                    "course_info": None,
+                })
+            return {"message": "Unassigned students", "students": enriched_students, "total": len(enriched_students)}
+
+        # Build query based on user role (normal listing)
+        query = {"role": "student", "is_active": True}
 
         # Apply branch filtering for non-super-admin users
         if current_role != UserRole.SUPER_ADMIN:
@@ -762,7 +841,7 @@ class UserController:
                 print(f"🔍 DEBUG: Current user data: {current_user}")
 
                 if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                    return {"message": "No students found", "students": [], "total": 0}
 
                 # Find all branches managed by this branch manager
                 managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
@@ -787,7 +866,7 @@ class UserController:
                             print(f"🔍 DEBUG: Using fallback branch: {fallback_branch['id']}")
 
                 if not managed_branches:
-                    raise HTTPException(status_code=403, detail="No branches assigned to this manager")
+                    return {"message": "No students found", "students": [], "total": 0}
 
                 # Get all branch IDs managed by this branch manager
                 managed_branch_ids = [branch["id"] for branch in managed_branches]
@@ -931,6 +1010,24 @@ class UserController:
                         "source": "legacy_user_document"  # Mark as legacy data for migration tracking
                     })
 
+            # Resolve branch_info (branch name) for list display - from first enrollment, user.branch, or user.branch_id
+            branch_info_response = None
+            branch_id_for_name = None
+            if enrollments:
+                branch_id_for_name = enrollments[0].get("branch_id")
+            if not branch_id_for_name and student.get("branch", {}).get("branch_id"):
+                branch_id_for_name = student["branch"]["branch_id"]
+            if not branch_id_for_name and student.get("branch_id"):
+                branch_id_for_name = student["branch_id"]
+            if branch_id_for_name:
+                branch_doc = await db.branches.find_one({"id": branch_id_for_name})
+                if branch_doc:
+                    branch_info_response = {
+                        "branch_id": branch_id_for_name,
+                        "location_id": branch_doc.get("location_id", ""),
+                        "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch")
+                    }
+
             # Prepare student details response
             student_details = {
                 "id": student_id,
@@ -948,6 +1045,7 @@ class UserController:
                 "is_active": student.get("is_active", True),
                 "created_at": student.get("created_at"),
                 "branch_id": student.get("branch_id"),
+                "branch_info": branch_info_response,
                 "address": student.get("address"),
                 "courses": courses_info,
                 "enrollments": courses_info,  # For compatibility with frontend

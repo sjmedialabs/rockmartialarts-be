@@ -62,7 +62,7 @@ async def log_activity(
         action=action,
         details=serialized_details,
         status=status,
-        ip_address=request.client.host if request else "N/A",
+        ip_address=request.client.host if (request and getattr(request, "client", None)) else "N/A",
         timestamp=datetime.utcnow()
     )
 

@@ -1,11 +1,11 @@
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
 from typing import List, Optional
 from datetime import datetime, timedelta
 import jwt
 import os
 import hashlib
+import bcrypt
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -20,7 +20,6 @@ load_dotenv(ROOT_DIR / '.env')
 
 # Security setup
 security = HTTPBearer()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.environ.get('SECRET_KEY', 'student_management_secret_key_2025_secure')
 ALGORITHM = "HS256"
 
@@ -28,39 +27,54 @@ ALGORITHM = "HS256"
 print(f"🔑 auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
+
+# Bcrypt 5.0+ raises ValueError if password > 72 bytes. We always truncate.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def _to_72_bytes_max(password: str) -> bytes:
+    """Bcrypt accepts max 72 bytes. Return bytes to pass to bcrypt."""
+    if password is None:
+        return b""
+    if isinstance(password, bytes):
+        return password[:BCRYPT_MAX_PASSWORD_BYTES]
+    b = password.encode("utf-8")
+    if len(b) <= BCRYPT_MAX_PASSWORD_BYTES:
+        return b
+    # Long password: use first 72 bytes of SHA-256 digest (deterministic)
+    return hashlib.sha256(b).digest()[:BCRYPT_MAX_PASSWORD_BYTES]
+
+
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt, handling long passwords safely."""
-    try:
-        # Handle passwords longer than 72 bytes by using SHA-256 hash first
-        password_bytes = password.encode('utf-8')
-        if len(password_bytes) > 72:
-            # Use SHA-256 to create a deterministic hash of the long password
-            password = hashlib.sha256(password_bytes).hexdigest()
-        
-        return pwd_context.hash(password)
-    except ValueError as e:
-        if "password cannot be longer than 72 bytes" in str(e):
-            # Fallback: use SHA-256 hash of the password
-            sha256_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
-            return pwd_context.hash(sha256_hash)
-        raise e
+    """Hash a password using bcrypt (no passlib). Never pass >72 bytes."""
+    payload = _to_72_bytes_max(password)[:BCRYPT_MAX_PASSWORD_BYTES]
+    return bcrypt.hashpw(payload, bcrypt.gensalt()).decode("utf-8")
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash, handling long passwords safely."""
+    """Verify a password against its hash using bcrypt (no passlib)."""
+    if plain_password is None and hashed_password is None:
+        return False
+    if not hashed_password:
+        return False
+    # Normalize to str and truncate so bcrypt 5.0+ never sees >72 bytes
+    if isinstance(plain_password, bytes):
+        plain_password = plain_password.decode("utf-8", errors="replace")
+    payload = _to_72_bytes_max(plain_password or "")[:BCRYPT_MAX_PASSWORD_BYTES]
+    # Guarantee bcrypt never receives >72 bytes (some bcrypt 5.x raise ValueError)
+    if len(payload) > BCRYPT_MAX_PASSWORD_BYTES:
+        payload = payload[:BCRYPT_MAX_PASSWORD_BYTES]
     try:
-        # Handle passwords longer than 72 bytes by using SHA-256 hash first
-        password_bytes = plain_password.encode('utf-8')
-        if len(password_bytes) > 72:
-            # Use SHA-256 to create a deterministic hash of the long password
-            plain_password = hashlib.sha256(password_bytes).hexdigest()
-        
-        return pwd_context.verify(plain_password, hashed_password)
-    except ValueError as e:
-        if "password cannot be longer than 72 bytes" in str(e):
-            # Fallback: use SHA-256 hash of the password
-            sha256_hash = hashlib.sha256(plain_password.encode('utf-8')).hexdigest()
-            return pwd_context.verify(sha256_hash, hashed_password)
-        raise e
+        if isinstance(hashed_password, bytes):
+            stored = hashed_password
+        else:
+            stored = hashed_password.encode("utf-8")
+        return bcrypt.checkpw(payload, stored)
+    except ValueError:
+        # bcrypt 5.0+: "password cannot be longer than 72 bytes" -> treat as wrong password
+        return False
+    except (TypeError, Exception):
+        return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()

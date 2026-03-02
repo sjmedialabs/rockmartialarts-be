@@ -21,17 +21,18 @@ async def get_users(
     branch_id: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH]))
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
-    """Get users with filtering - accessible by Super Admin, Coach Admin, and Coach"""
+    """Get users with filtering - accessible by Super Admin, Coach Admin, Coach, and Branch Manager"""
     return await UserController.get_users(role, branch_id, skip, limit, current_user)
 
 @router.get("/students/details")
 async def get_student_details(
+    unassigned_only: Optional[bool] = False,
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
-    """Get detailed student information with course enrollment data (Authenticated endpoint)"""
-    return await UserController.get_student_details(current_user)
+    """Get detailed student information. If unassigned_only=true, returns only students with no active branch enrollment (for Assign to Branch)."""
+    return await UserController.get_student_details(current_user, unassigned_only=unassigned_only)
 
 @router.get("/{user_id}/enrollments")
 async def get_user_enrollments(

@@ -1,10 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pathlib import Path
 import os
 import ssl
+import logging
 from contextlib import asynccontextmanager
 
 # Import routes
@@ -135,6 +137,31 @@ async def options_handler():
 @app.get("/test-coach-auth")
 async def test_coach_auth():
     return {"message": "Coach authorization logic has been updated", "timestamp": "2025-09-20"}
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """Convert bcrypt 72-byte ValueError to 401 so login never returns 500."""
+    msg = str(exc)
+    if "72 bytes" in msg and "password" in msg.lower():
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid email or password", "message": "Invalid email or password"},
+        )
+    return JSONResponse(status_code=400, content={"detail": msg, "message": msg})
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Return JSON with actual error for 500s so the frontend can show it."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    logging.exception("Unhandled exception")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "message": str(exc)},
+    )
+
 
 if __name__ == "__main__":
     import uvicorn

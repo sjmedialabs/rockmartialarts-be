@@ -118,7 +118,7 @@ class CoachController:
         area_of_expertise: Optional[str] = None,
         current_user: dict = None
     ):
-        """Get coaches with filtering"""
+        """Get coaches with filtering. Branch managers see only coaches in their managed branches."""
         db = get_db()
         
         filter_query = {}
@@ -126,6 +126,16 @@ class CoachController:
             filter_query["is_active"] = True
         if area_of_expertise:
             filter_query["areas_of_expertise"] = {"$in": [area_of_expertise]}
+
+        if current_user and current_user.get("role") == "branch_manager":
+            branch_manager_id = current_user.get("id")
+            if branch_manager_id:
+                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
+                managed_branch_ids = [b["id"] for b in managed_branches]
+                if managed_branch_ids:
+                    filter_query["branch_id"] = {"$in": managed_branch_ids}
+                else:
+                    filter_query["branch_id"] = {"$in": []}
         
         coaches = await db.coaches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         

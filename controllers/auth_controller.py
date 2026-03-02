@@ -76,6 +76,11 @@ class AuthController:
             if not user_dict.get("branch_id"):
                 user_dict["branch_id"] = user_data.branch.branch_id
 
+        if getattr(user_data, "address", None) is not None:
+            user_dict["address"] = user_data.address
+        if getattr(user_data, "emergency_contact", None) is not None:
+            user_dict["emergency_contact"] = user_data.emergency_contact
+
         result = await db.users.insert_one(user_dict)
 
         # Create enrollment record if course information is provided (for students)
@@ -147,57 +152,78 @@ class AuthController:
     @staticmethod
     async def login(user_credentials: UserLogin, request: Request):
         """User login"""
-        db = get_db()
-        
-        user = await db.users.find_one({"email": user_credentials.email})
-        if not user or not verify_password(user_credentials.password, user["password"]):
-            await log_activity(
-                request=request,
-                action="login_attempt",
-                status="failure",
-                details={"email": user_credentials.email, "reason": "Incorrect email or password"}
-            )
-            raise HTTPException(status_code=401, detail="Incorrect email or password")
-        
-        if not user.get("is_active", False):
-            await log_activity(
-                request=request,
-                action="login_attempt",
-                status="failure",
-                user_id=user["id"],
-                user_name=user["full_name"],
-                details={"email": user_credentials.email, "reason": "Account is deactivated"}
-            )
-            raise HTTPException(status_code=400, detail="Account is deactivated")
-        
-        access_token = create_access_token(data={"sub": user["id"], "role": user["role"]})
+        try:
+            db = get_db()
+            if db is None:
+                raise HTTPException(status_code=503, detail="Database not initialized")
+            
+            user = await db.users.find_one({"email": user_credentials.email})
+            # Support both "password" and "password_hash" for stored hash
+            stored_hash = user.get("password") if user else None
+            if user and not stored_hash:
+                stored_hash = user.get("password_hash")
+            if not user or not stored_hash or not verify_password(user_credentials.password, stored_hash):
+                try:
+                    await log_activity(
+                        request=request,
+                        action="login_attempt",
+                        status="failure",
+                        details={"email": user_credentials.email, "reason": "Incorrect email or password"}
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=401, detail="Incorrect email or password")
+            
+            if not user.get("is_active", False):
+                try:
+                    await log_activity(
+                        request=request,
+                        action="login_attempt",
+                        status="failure",
+                        user_id=user["id"],
+                        user_name=user.get("full_name", ""),
+                        details={"email": user_credentials.email, "reason": "Account is deactivated"}
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=400, detail="Account is deactivated")
+            
+            access_token = create_access_token(data={"sub": user["id"], "role": user.get("role", "student")})
 
-        await log_activity(
-            request=request,
-            action="login_success",
-            user_id=user["id"],
-            user_name=user["full_name"],
-            details={"email": user["email"]}
-        )
+            try:
+                await log_activity(
+                    request=request,
+                    action="login_success",
+                    user_id=user["id"],
+                    user_name=user.get("full_name", ""),
+                    details={"email": user["email"]}
+                )
+            except Exception:
+                pass
 
-        # Extract branch_id for easier access
-        branch_id = user.get("branch_id")
-        if not branch_id and user.get("branch"):
-            branch_id = user["branch"].get("branch_id")
+            # Extract branch_id for easier access
+            branch_id = user.get("branch_id")
+            if not branch_id and user.get("branch"):
+                branch_id = user["branch"].get("branch_id")
 
-        return {"access_token": access_token, "token_type": "bearer", "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "role": user["role"],
-            "first_name": user.get("first_name"),
-            "last_name": user.get("last_name"),
-            "full_name": user["full_name"],
-            "date_of_birth": user.get("date_of_birth"),
-            "gender": user.get("gender"),
-            "branch_id": branch_id,  # Include branch_id for easier access
-            "course": user.get("course"),  # Return nested course object directly
-            "branch": user.get("branch")   # Return nested branch object directly
-        }}
+            return {"access_token": access_token, "token_type": "bearer", "expires_in": 86400, "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "role": user.get("role", "student"),
+                "first_name": user.get("first_name"),
+                "last_name": user.get("last_name"),
+                "full_name": user.get("full_name", ""),
+                "date_of_birth": user.get("date_of_birth"),
+                "gender": user.get("gender"),
+                "branch_id": branch_id,
+                "course": user.get("course"),
+                "branch": user.get("branch")
+            }}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.exception("Login failed")
+            raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
 
     @staticmethod
     async def forgot_password(forgot_password_data: ForgotPassword):

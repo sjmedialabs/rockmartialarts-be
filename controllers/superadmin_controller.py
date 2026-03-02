@@ -1,6 +1,5 @@
 from fastapi import HTTPException, status
 from datetime import datetime, timedelta
-from passlib.context import CryptContext
 import jwt
 import os
 from typing import Optional
@@ -11,13 +10,11 @@ from models.superadmin_models import SuperAdmin, SuperAdminRegister, SuperAdminL
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.email_service import send_password_reset_email
+from utils.auth import hash_password, verify_password, BCRYPT_MAX_PASSWORD_BYTES
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / '.env')
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # JWT settings
 SECRET_KEY = os.getenv("SECRET_KEY", "student_management_secret_key_2025")
@@ -25,16 +22,6 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
 class SuperAdminController:
-    @staticmethod
-    def hash_password(password: str) -> str:
-        """Hash a password"""
-        return pwd_context.hash(password)
-    
-    @staticmethod
-    def verify_password(plain_password: str, hashed_password: str) -> bool:
-        """Verify a password against its hash"""
-        return pwd_context.verify(plain_password, hashed_password)
-    
     @staticmethod
     def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         """Create JWT access token"""
@@ -60,8 +47,8 @@ class SuperAdminController:
                 detail="Email already exists"
             )
         
-        # Hash password
-        hashed_password = SuperAdminController.hash_password(admin_data.password)
+        # Hash password (utils.auth truncates to 72 bytes for bcrypt)
+        hashed_password = hash_password(admin_data.password)
         
         # Create super admin
         admin = SuperAdmin(
@@ -105,8 +92,10 @@ class SuperAdminController:
                 detail="Invalid email or password"
             )
         
-        # Verify password
-        if not SuperAdminController.verify_password(login_data.password, admin["password_hash"]):
+        # Truncate password to 72 bytes (bcrypt limit) before verify to avoid 500 from bcrypt 5.x
+        raw = (login_data.password or "").encode("utf-8")[:BCRYPT_MAX_PASSWORD_BYTES]
+        password_to_check = raw.decode("utf-8", errors="replace")
+        if not verify_password(password_to_check, admin["password_hash"]):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
@@ -291,11 +280,11 @@ class SuperAdminController:
         except jwt.PyJWTError:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-        new_hashed_password = SuperAdminController.hash_password(new_password)
+        new_hashed_password = hash_password(new_password)
         db = get_db()
         result = await db.superadmins.update_one(
             {"id": admin_id},
-            {"$set": {"password": new_hashed_password, "updated_at": datetime.utcnow()}}
+            {"$set": {"password_hash": new_hashed_password, "updated_at": datetime.utcnow()}}
         )
 
         if result.matched_count == 0:

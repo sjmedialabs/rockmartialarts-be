@@ -49,10 +49,9 @@ class UserCreate(BaseModel):
     date_of_birth: Optional[date] = None
     gender: Optional[str] = None
     biometric_id: Optional[str] = None
-    # Branch assignment for staff members (coaches, admins)
+    address: Optional[dict] = None  # { line1, area, city, state, pincode, country }
+    emergency_contact: Optional[dict] = None  # { name, phone, relationship }
     branch_id: Optional[str] = None
-    # DEPRECATED: Course enrollment should be handled via enrollments collection
-    # These fields remain for backward compatibility during migration
     course: Optional[CourseInfo] = None
     branch: Optional[BranchInfo] = None
 
@@ -77,11 +76,11 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     date_of_birth: Optional[date] = None
     gender: Optional[str] = None
+    address: Optional[dict] = None  # { line1, area, city, state, pincode, country }
+    emergency_contact: Optional[dict] = None  # { name, phone, relationship }
     # DEPRECATED: Course enrollment should be handled via enrollments collection
-    # These fields remain for backward compatibility during migration
     course: Optional[CourseInfo] = None
     branch: Optional[BranchInfo] = None
-    # Flat fields for backward compatibility
     course_category_id: Optional[str] = None
     course_id: Optional[str] = None
     course_duration: Optional[str] = None
