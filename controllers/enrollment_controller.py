@@ -3,11 +3,12 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from models.enrollment_models import EnrollmentCreate, Enrollment, PaymentStatus
+from models.enrollment_branch_change_models import EnrollmentBranchChangeRequest, EnrollmentBranchChangeCreate, EnrollmentBranchChangeStatus
 from models.payment_models import Payment
 from models.student_models import StudentEnrollmentCreate
 from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
-from utils.database import db
+from utils.database import db, get_db
 from utils.helpers import serialize_doc, send_whatsapp
 
 class EnrollmentController:
@@ -302,4 +303,68 @@ class EnrollmentController:
             "enrollments": serialize_doc(enrollments),
             "count": len(enrollments),
             "message": "Enrollments retrieved successfully"
+        }
+
+    @staticmethod
+    async def create_branch_change_request(
+        enrollment_id: str,
+        body: EnrollmentBranchChangeCreate,
+        current_user: dict
+    ):
+        """Create a branch change request for an enrollment. Request is sent to branch admin for approval."""
+        if not db:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        enrollment = await db.enrollments.find_one({
+            "id": enrollment_id,
+            "student_id": current_user["id"],
+            "is_active": True
+        })
+        if not enrollment:
+            raise HTTPException(status_code=404, detail="Enrollment not found or you do not have access to it.")
+
+        new_branch = await db.branches.find_one({"id": body.new_branch_id})
+        if not new_branch:
+            raise HTTPException(status_code=404, detail="New branch not found.")
+
+        if enrollment["branch_id"] == body.new_branch_id:
+            raise HTTPException(status_code=400, detail="New branch must be different from current branch.")
+
+        # Check that the new branch offers this course (optional: branch assignments)
+        course_id = enrollment["course_id"]
+        branch_assignments = await db.branches.find_one(
+            {"id": body.new_branch_id},
+            {"assignments": 1}
+        )
+        if branch_assignments and "assignments" in branch_assignments:
+            courses = branch_assignments.get("assignments", {}).get("courses", [])
+            if courses and course_id not in courses:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This course is not offered at the selected branch."
+                )
+
+        # Avoid duplicate pending request
+        existing = await db.enrollment_branch_change_requests.find_one({
+            "enrollment_id": enrollment_id,
+            "status": "pending"
+        })
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="A branch change request for this enrollment is already pending."
+            )
+
+        request_doc = EnrollmentBranchChangeRequest(
+            enrollment_id=enrollment_id,
+            student_id=current_user["id"],
+            current_branch_id=enrollment["branch_id"],
+            new_branch_id=body.new_branch_id,
+            reason=body.reason or "Student requested branch change"
+        )
+        await db.enrollment_branch_change_requests.insert_one(request_doc.dict())
+
+        return {
+            "message": "Branch change request submitted successfully. Your request will be sent to the branch admin for approval. You will be notified once the request is processed.",
+            "request_id": request_doc.id
         }

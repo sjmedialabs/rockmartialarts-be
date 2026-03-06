@@ -17,12 +17,33 @@ class RequestController:
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
         """Create a new transfer request."""
-        if not current_user.get("branch_id"):
-            raise HTTPException(status_code=400, detail="User is not currently assigned to a branch.")
+        # Determine current_branch_id in a student-friendly way:
+        # 1) Prefer explicit current_branch_id from request body
+        # 2) Then look up from enrollment_id (if provided)
+        # 3) Finally fall back to user's branch_id
+        current_branch_id = request_data.current_branch_id
+
+        # If not provided, try to infer from enrollment
+        if not current_branch_id and request_data.enrollment_id:
+            enrollment = await db.enrollments.find_one({
+                "id": request_data.enrollment_id,
+                "student_id": current_user["id"],
+                "is_active": True
+            })
+            if enrollment:
+                current_branch_id = enrollment.get("branch_id")
+
+        # Fallback: use student's branch_id if still missing
+        if not current_branch_id:
+            current_branch_id = current_user.get("branch_id")
+
+        if not current_branch_id:
+            raise HTTPException(status_code=400, detail="User is not currently assigned to a branch for this transfer request.")
 
         transfer_request = TransferRequest(
             student_id=current_user["id"],
-            current_branch_id=current_user["branch_id"],
+            enrollment_id=request_data.enrollment_id,
+            current_branch_id=current_branch_id,
             **request_data.dict()
         )
         await db.transfer_requests.insert_one(transfer_request.dict())

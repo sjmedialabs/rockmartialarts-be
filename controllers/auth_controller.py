@@ -11,7 +11,7 @@ from models.user_models import UserCreate, UserLogin, ForgotPassword, ResetPassw
 from utils.auth import hash_password, verify_password, create_access_token, get_current_active_user, SECRET_KEY, ALGORITHM
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms
-from utils.email_service import send_password_reset_email
+from utils.email_service import send_password_reset_email, send_password_reset_email_webhook
 
 class AuthController:
     @staticmethod
@@ -240,13 +240,21 @@ class AuthController:
             expires_delta=timedelta(minutes=15)
         )
 
-        # Send password reset email
+        # Send password reset email: try SMTP first, then webhook if SMTP not configured or fails
         user_name = user.get("full_name", f"{user.get('first_name', '')} {user.get('last_name', '')}").strip()
         email_sent = await send_password_reset_email(
             to_email=user["email"],
             reset_token=reset_token,
-            user_name=user_name or "User"
+            user_name=user_name or "User",
+            user_type="student"
         )
+        if not email_sent:
+            email_sent = await send_password_reset_email_webhook(
+                to_email=user["email"],
+                reset_token=reset_token,
+                user_name=user_name or "User",
+                user_type="student"
+            )
 
         # Log the password reset attempt
         logging.info(f"Password reset requested for {user['email']}. Email sent: {email_sent}")

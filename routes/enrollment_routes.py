@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, status
 from typing import Optional
 from controllers.enrollment_controller import EnrollmentController
 from models.enrollment_models import EnrollmentCreate
+from models.enrollment_branch_change_models import EnrollmentBranchChangeCreate
 from models.student_models import StudentEnrollmentCreate
 from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
@@ -49,3 +50,13 @@ async def get_student_enrollments(
 ):
     """Get all enrollments for a specific student - Students can only view their own enrollments"""
     return await EnrollmentController.get_student_enrollments(student_id, current_user, active_only)
+
+
+@router.post("/{enrollment_id}/branch-change-request", status_code=status.HTTP_201_CREATED)
+async def create_enrollment_branch_change_request(
+    enrollment_id: str,
+    body: EnrollmentBranchChangeCreate,
+    current_user: dict = Depends(require_role([UserRole.STUDENT]))
+):
+    """Submit a branch change request for an enrollment. Sent to branch admin for approval."""
+    return await EnrollmentController.create_branch_change_request(enrollment_id, body, current_user)
