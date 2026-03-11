@@ -19,6 +19,14 @@ class CourseController:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
+
+        # Check for duplicate course title
+        existing_course = await db.courses.find_one({
+            "title": {"$regex": f"^{course_data.title.strip()}$", "$options": "i"}
+        })
+        if existing_course:
+            raise HTTPException(status_code=400, detail=f"A course with the name '{course_data.title}' already exists")
+
         course = Course(**course_data.dict())
 
         # Store the course with nested structure exactly as provided
@@ -286,6 +294,15 @@ class CourseController:
         update_data = {k: v for k, v in course_update.dict(exclude_unset=True).items()}
         if not update_data:
             raise HTTPException(status_code=400, detail="No update data provided")
+
+        # Check for duplicate course title on update
+        if "title" in update_data and update_data["title"]:
+            title_conflict = await db.courses.find_one({
+                "title": {"$regex": f"^{update_data['title'].strip()}$", "$options": "i"},
+                "id": {"$ne": course_id}
+            })
+            if title_conflict:
+                raise HTTPException(status_code=400, detail=f"A course with the name '{update_data['title']}' already exists")
 
         # When pricing is updated, set base_fee / fee_per_duration / branch_pricing for payment API
         if "pricing" in update_data:

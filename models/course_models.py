@@ -17,6 +17,13 @@ class MediaResources(BaseModel):
     course_image_url: Optional[str] = None
     promo_video_url: Optional[str] = None
 
+
+class CourseSEO(BaseModel):
+    meta_title: Optional[str] = None
+    meta_description: Optional[str] = None
+    meta_keywords: Optional[str] = None
+    og_image: Optional[str] = None
+
 class BranchPriceEntry(BaseModel):
     branch_id: str
     amount: Optional[float] = None
@@ -61,6 +68,8 @@ class Course(BaseModel):
     media_resources: MediaResources
     pricing: Pricing
     settings: Settings
+    page_content: Optional[Dict[str, Any]] = None
+    seo: Optional[CourseSEO] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -79,6 +88,8 @@ class CourseCreate(BaseModel):
     media_resources: MediaResources
     pricing: Pricing
     settings: Settings
+    page_content: Optional[Dict[str, Any]] = None
+    seo: Optional[CourseSEO] = None
 
 class CourseUpdate(BaseModel):
     title: Optional[str] = None
@@ -96,3 +107,5 @@ class CourseUpdate(BaseModel):
     media_resources: Optional[MediaResources] = None
     pricing: Optional[Pricing] = None
     settings: Optional[Settings] = None
+    page_content: Optional[Dict[str, Any]] = None
+    seo: Optional[CourseSEO] = None

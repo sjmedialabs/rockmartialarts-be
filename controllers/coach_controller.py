@@ -249,6 +249,20 @@ class CoachController:
                 if email_conflict:
                     raise HTTPException(status_code=400, detail="Email already exists")
             
+            # Check for phone conflicts
+            full_phone = f"{coach_update.contact_info.country_code}{coach_update.contact_info.phone}"
+            existing_phone = existing_coach.get("contact_info", {}).get("phone", "")
+            if coach_update.contact_info.phone != existing_phone:
+                phone_conflict = await db.coaches.find_one({
+                    "$or": [
+                        {"phone": full_phone},
+                        {"contact_info.phone": coach_update.contact_info.phone}
+                    ],
+                    "id": {"$ne": coach_id}
+                })
+                if phone_conflict:
+                    raise HTTPException(status_code=400, detail="Phone number already exists")
+            
             # Update contact info (exclude password from nested structure)
             update_data["contact_info"] = {
                 "email": coach_update.contact_info.email,

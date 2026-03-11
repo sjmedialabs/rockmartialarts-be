@@ -36,6 +36,8 @@ from routes import (
 )
 from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
+from routes.upload_routes import router as upload_router
+from routes.cms_routes import router as cms_router
 
 # Import database utility
 from utils.database import db
@@ -120,6 +122,8 @@ app.include_router(message_router, prefix="/api/messages", tags=["Messages"])
 app.include_router(reports_router, prefix="/api/reports", tags=["Reports"])
 app.include_router(attendance_router, prefix="/api/attendance", tags=["Attendance"])
 app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches with Courses"])
+app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
+app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
 
 @app.get("/")
 async def root():
