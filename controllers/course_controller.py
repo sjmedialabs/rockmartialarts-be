@@ -506,6 +506,59 @@ class CourseController:
         }
 
     @staticmethod
+    async def get_public_courses_by_branch(branch_id: str):
+        """Get courses assigned to a branch with details and fees - Public (no auth)."""
+        db = get_db()
+        branch = await db.branches.find_one({"id": branch_id, "is_active": True})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        course_ids = branch.get("assignments", {}).get("courses", [])
+        if not course_ids:
+            timings = (branch.get("operational_details") or {}).get("timings", [])
+            return {"courses": [], "branch_timings": timings}
+        courses = await db.courses.find({
+            "id": {"$in": course_ids},
+            "settings.active": True
+        }).to_list(length=100)
+        branch_timings = (branch.get("operational_details") or {}).get("timings", [])
+        result_courses = []
+        for course in courses:
+            serialized = serialize_doc(course)
+            pricing = course.get("pricing") or {}
+            branch_prices = pricing.get("branch_prices") or []
+            branch_entry = next((b for b in branch_prices if b.get("branch_id") == branch_id), None)
+            if branch_entry:
+                fees = {
+                    "currency": branch_entry.get("currency") or pricing.get("currency", "INR"),
+                    "amount": branch_entry.get("amount"),
+                    "fee_1_month": branch_entry.get("fee_1_month"),
+                    "fee_3_months": branch_entry.get("fee_3_months"),
+                    "fee_6_months": branch_entry.get("fee_6_months"),
+                    "fee_1_year": branch_entry.get("fee_1_year"),
+                    "fee_per_duration": branch_entry.get("fee_per_duration"),
+                }
+            else:
+                fees = {
+                    "currency": pricing.get("currency", "INR"),
+                    "amount": pricing.get("amount"),
+                    "fee_1_month": pricing.get("fee_1_month"),
+                    "fee_3_months": pricing.get("fee_3_months"),
+                    "fee_6_months": pricing.get("fee_6_months"),
+                    "fee_1_year": pricing.get("fee_1_year"),
+                    "fee_per_duration": pricing.get("fee_per_duration"),
+                }
+            result_courses.append({
+                "id": serialized.get("id"),
+                "title": serialized.get("title"),
+                "code": serialized.get("code"),
+                "description": serialized.get("description"),
+                "difficulty_level": serialized.get("difficulty_level"),
+                "media_resources": serialized.get("media_resources") or {},
+                "pricing": fees,
+            })
+        return {"courses": result_courses, "branch_timings": branch_timings}
+
+    @staticmethod
     async def get_courses_by_category(
         category_id: str,
         difficulty_level: Optional[str] = None,

@@ -84,6 +84,11 @@ async def get_public_courses(
     """Get all courses - Public endpoint (no authentication required)"""
     return await CourseController.get_public_courses(active_only, skip, limit)
 
+@router.get("/public/by-branch/{branch_id}")
+async def get_public_courses_by_branch(branch_id: str):
+    """Get courses at a branch with details and fees - Public (no auth)."""
+    return await CourseController.get_public_courses_by_branch(branch_id)
+
 @router.get("/public/by-category/{category_id}")
 async def get_courses_by_category(
     category_id: str,

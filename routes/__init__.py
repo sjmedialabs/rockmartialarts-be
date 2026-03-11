@@ -10,6 +10,8 @@ from .category_routes import router as category_router
 from .duration_routes import router as duration_router
 from .location_routes import router as location_router
 from .branch_public_routes import router as branch_public_router
+from .public_branch_routes import router as public_branch_router
+from .public_branch_by_slug_routes import router as public_branch_by_slug_router
 from .enrollment_routes import router as enrollment_router
 from .payment_routes import router as payment_router
 from .request_routes import router as request_router
@@ -36,6 +38,8 @@ __all__ = [
     'duration_router',
     'location_router',
     'branch_public_router',
+    'public_branch_router',
+    'public_branch_by_slug_router',
     'enrollment_router',
     'payment_router',
     'request_router',

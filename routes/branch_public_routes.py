@@ -25,3 +25,9 @@ async def get_all_branches_public(
 ):
     """Get all branches - Public endpoint (no authentication required)"""
     return await BranchController.get_branches_public(active_only, skip, limit)
+
+
+@router.get("/public/{branch_id}")
+async def get_branch_public(branch_id: str):
+    """Get one branch by ID for public detail page (no authentication required)"""
+    return await BranchController.get_branch_public(branch_id)

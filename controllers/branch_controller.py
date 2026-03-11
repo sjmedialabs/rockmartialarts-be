@@ -1,3 +1,4 @@
+import re
 from fastapi import HTTPException, Depends, status
 from typing import Optional
 from datetime import datetime
@@ -167,18 +168,38 @@ class BranchController:
         # Get total count
         total = await db.branches.count_documents(query)
 
-        # Format branches for public consumption
+        # Format branches for public consumption (include operational_details + assignments for detail page)
         formatted_branches = []
         for branch in branches:
+            branch_info = branch.get("branch") or {}
+            operational = branch.get("operational_details") or {}
+            assignments = branch.get("assignments") or {}
             formatted_branch = {
                 "id": branch.get("id"),
-                "name": branch.get("branch", {}).get("name"),
-                "code": branch.get("branch", {}).get("code"),
-                "email": branch.get("branch", {}).get("email"),
-                "phone": branch.get("branch", {}).get("phone"),
-                "address": branch.get("branch", {}).get("address", {}),
+                "name": branch_info.get("name"),
+                "code": branch_info.get("code"),
+                "email": branch_info.get("email"),
+                "phone": branch_info.get("phone"),
+                "address": branch_info.get("address", {}),
+                "branch": {
+                    "name": branch_info.get("name"),
+                    "code": branch_info.get("code"),
+                    "email": branch_info.get("email"),
+                    "phone": branch_info.get("phone"),
+                    "address": branch_info.get("address", {}),
+                },
                 "location_id": branch.get("location_id"),
-                "is_active": branch.get("is_active", True)
+                "manager_id": branch.get("manager_id"),
+                "is_active": branch.get("is_active", True),
+                "operational_details": {
+                    "timings": operational.get("timings", []),
+                    "courses_offered": operational.get("courses_offered", []),
+                    "holidays": operational.get("holidays", []),
+                },
+                "assignments": {
+                    "accessories_available": assignments.get("accessories_available", False),
+                    "courses": assignments.get("courses", []),
+                },
             }
             formatted_branches.append(formatted_branch)
 
@@ -189,6 +210,48 @@ class BranchController:
             "skip": skip,
             "limit": limit
         }
+
+    @staticmethod
+    async def get_branch_public(branch_id: str):
+        """Get one branch by ID for public detail page (no auth)."""
+        db = get_db()
+        branch = await db.branches.find_one({"id": branch_id, "is_active": True})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        return serialize_doc(branch)
+
+    @staticmethod
+    def _name_to_slug(name: str) -> str:
+        """Convert branch name to URL slug (same logic as frontend branchNameToSlug)."""
+        if not name or not isinstance(name, str):
+            return ""
+        s = name.strip().lower()
+        s = re.sub(r"\s+", "-", s)
+        s = re.sub(r"[^a-z0-9-]", "", s)
+        s = re.sub(r"-+", "-", s).strip("-")
+        return s or "branch"
+
+    @staticmethod
+    async def get_branch_by_slug(slug: str):
+        """Get one branch by URL slug for public detail page (no auth). Slug matches branch name normalized."""
+        if not slug or not slug.strip():
+            raise HTTPException(status_code=404, detail="Branch not found")
+        slug = slug.strip().lower()
+        db = get_db()
+        # If slug looks like UUID, try by id first
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", slug, re.I):
+            branch = await db.branches.find_one({"id": slug, "is_active": True})
+            if branch:
+                return serialize_doc(branch)
+        # Find by name slug (check both nested branch.name and top-level name)
+        branches = await db.branches.find({"is_active": True}).to_list(length=500)
+        for b in branches:
+            name = (b.get("branch") or {}).get("name") or b.get("name") or ""
+            if not name:
+                continue
+            if BranchController._name_to_slug(str(name).strip()) == slug:
+                return serialize_doc(b)
+        raise HTTPException(status_code=404, detail="Branch not found")
 
     @staticmethod
     async def get_branch(

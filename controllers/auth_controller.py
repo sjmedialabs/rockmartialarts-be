@@ -388,12 +388,13 @@ class AuthController:
         if not user:
             raise HTTPException(status_code=404, detail="Student not found")
 
-        # Get enrollment information (all enrollments so we can show expiry date when inactive)
+        # Get enrollment information (all enrollments so we can show expiry date even when inactive)
         enrollments_cursor = db.enrollments.find({"student_id": current_user["id"]}).sort("end_date", -1)
         enrollments = await enrollments_cursor.to_list(100)
 
         # Enrich enrollment data with course and branch details
         enriched_enrollments = []
+        latest_end_date = None
         for enrollment in enrollments:
             # Get course details
             course = await db.courses.find_one({"id": enrollment["course_id"]})
@@ -414,6 +415,21 @@ class AuthController:
             }
             enriched_enrollments.append(enriched_enrollment)
 
+            # Track latest end_date for subscription expiry
+            end_date = enrollment.get("end_date")
+            if end_date:
+                try:
+                    # end_date may already be a datetime; if not, attempt to parse via ISO format
+                    if isinstance(end_date, str):
+                        parsed = datetime.fromisoformat(end_date.replace("Z", "+00:00")) if "T" in end_date else datetime.fromisoformat(end_date)
+                    else:
+                        parsed = end_date
+                    if latest_end_date is None or parsed > latest_end_date:
+                        latest_end_date = parsed
+                except Exception:
+                    # If parsing fails, skip this record
+                    pass
+
         # Prepare profile response
         profile_data = {
             "id": user["id"],
@@ -430,7 +446,8 @@ class AuthController:
             "is_active": user["is_active"],
             "created_at": user["created_at"],
             "updated_at": user["updated_at"],
-            "enrollments": enriched_enrollments
+            "enrollments": enriched_enrollments,
+            "subscription_expiry": latest_end_date.isoformat() if latest_end_date else None
         }
 
         return {

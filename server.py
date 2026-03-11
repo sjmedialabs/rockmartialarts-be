@@ -21,6 +21,8 @@ from routes import (
     duration_router,
     location_router,
     branch_public_router,
+    public_branch_router,
+    public_branch_by_slug_router,
     enrollment_router,
     payment_router,
     request_router,
@@ -102,13 +104,15 @@ app.include_router(superadmin_router, prefix="/api/superadmin", tags=["Super Adm
 app.include_router(auth_router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(user_router, prefix="/api/users", tags=["Users"])
 app.include_router(coach_router, prefix="/api/coaches", tags=["Coaches"])
+app.include_router(branch_public_router, prefix="/api/branches", tags=["Public Branches"])
 app.include_router(branch_router, prefix="/api/branches", tags=["Branches"])
+app.include_router(public_branch_router, prefix="/api/public-branch", tags=["Public Branch by ID"])
+app.include_router(public_branch_by_slug_router, prefix="/api/public-branch-by-slug", tags=["Public Branch by Slug"])
 app.include_router(branch_manager_router, prefix="/api/branch-managers", tags=["Branch Managers"])
 app.include_router(course_router, prefix="/api/courses", tags=["Courses"])
 app.include_router(category_router, prefix="/api/categories", tags=["Categories"])
 app.include_router(duration_router, prefix="/api/durations", tags=["Durations"])
 app.include_router(location_router, prefix="/api/locations", tags=["Locations"])
-app.include_router(branch_public_router, prefix="/api/branches", tags=["Public Branches"])
 app.include_router(enrollment_router, prefix="/api/enrollments", tags=["Enrollments"])
 app.include_router(payment_router, prefix="/api/payments", tags=["Payments"])
 app.include_router(request_router, prefix="/api/requests", tags=["Requests"])
