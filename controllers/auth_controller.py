@@ -150,6 +150,77 @@ class AuthController:
         return response_data
 
     @staticmethod
+    async def create_user_silent(user_data: UserCreate):
+        """Create user and optional enrollment without sending SMS. Used by bulk import."""
+        db = get_db()
+        existing_user = await db.users.find_one({
+            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
+        })
+        if existing_user:
+            raise HTTPException(status_code=400, detail=f"User with email {user_data.email} or phone {user_data.phone} already exists")
+        if not user_data.password:
+            user_data.password = secrets.token_urlsafe(8)
+        hashed_password = hash_password(user_data.password)
+        full_name = f"{user_data.first_name} {user_data.last_name}".strip()
+        user_dict = {
+            "id": str(uuid.uuid4()),
+            "email": user_data.email,
+            "phone": user_data.phone,
+            "first_name": user_data.first_name,
+            "last_name": user_data.last_name,
+            "full_name": full_name,
+            "role": user_data.role.value,
+            "biometric_id": user_data.biometric_id,
+            "is_active": True,
+            "date_of_birth": user_data.date_of_birth.isoformat() if user_data.date_of_birth else None,
+            "gender": user_data.gender,
+            "password": hashed_password,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        if user_data.branch_id:
+            user_dict["branch_id"] = user_data.branch_id
+        if user_data.course:
+            user_dict["course"] = {
+                "category_id": user_data.course.category_id,
+                "course_id": user_data.course.course_id,
+                "duration": user_data.course.duration
+            }
+        if user_data.branch:
+            user_dict["branch"] = {
+                "location_id": user_data.branch.location_id,
+                "branch_id": user_data.branch.branch_id
+            }
+            if not user_dict.get("branch_id"):
+                user_dict["branch_id"] = user_data.branch.branch_id
+        if getattr(user_data, "address", None) is not None:
+            user_dict["address"] = user_data.address
+        if getattr(user_data, "emergency_contact", None) is not None:
+            user_dict["emergency_contact"] = user_data.emergency_contact
+        await db.users.insert_one(user_dict)
+        enrollment_id = None
+        if user_data.course and user_data.branch and user_data.role == UserRole.STUDENT:
+            try:
+                from models.enrollment_models import Enrollment, PaymentStatus
+                enrollment = Enrollment(
+                    student_id=user_dict["id"],
+                    course_id=user_data.course.course_id,
+                    branch_id=user_data.branch.branch_id,
+                    start_date=datetime.utcnow(),
+                    end_date=datetime.utcnow() + timedelta(days=365),
+                    fee_amount=0.0,
+                    admission_fee=0.0,
+                    payment_status=PaymentStatus.PENDING,
+                    enrollment_date=datetime.utcnow(),
+                    is_active=True
+                )
+                await db.enrollments.insert_one(enrollment.dict())
+                enrollment_id = enrollment.id
+            except Exception as e:
+                print(f"❌ Error creating enrollment record: {e}")
+        return {"user_id": user_dict["id"], "enrollment_id": enrollment_id}
+
+    @staticmethod
     async def login(user_credentials: UserLogin, request: Request):
         """User login"""
         try:

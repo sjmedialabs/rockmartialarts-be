@@ -521,6 +521,7 @@ class CourseController:
             "settings.active": True
         }).to_list(length=100)
         branch_timings = (branch.get("operational_details") or {}).get("timings", [])
+        durations = await db.durations.find({"is_active": True}).sort("display_order", 1).to_list(100)
         result_courses = []
         for course in courses:
             serialized = serialize_doc(course)
@@ -547,14 +548,25 @@ class CourseController:
                     "fee_1_year": pricing.get("fee_1_year"),
                     "fee_per_duration": pricing.get("fee_per_duration"),
                 }
+            available_durations = []
+            for d in durations:
+                available_durations.append({
+                    "id": d["id"],
+                    "name": d.get("name", d.get("id", "")),
+                    "code": d.get("code", d.get("id", "")),
+                    "duration_months": d.get("duration_months", 1),
+                    "pricing_multiplier": d.get("pricing_multiplier", 1.0),
+                })
             result_courses.append({
                 "id": serialized.get("id"),
                 "title": serialized.get("title"),
                 "code": serialized.get("code"),
                 "description": serialized.get("description"),
                 "difficulty_level": serialized.get("difficulty_level"),
+                "category_id": serialized.get("category_id"),
                 "media_resources": serialized.get("media_resources") or {},
                 "pricing": fees,
+                "available_durations": available_durations,
             })
         return {"courses": result_courses, "branch_timings": branch_timings}
 

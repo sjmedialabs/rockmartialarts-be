@@ -10,6 +10,16 @@ class SEOSettings(BaseModel):
     og_image: Optional[str] = None
 
 
+class TestimonialItem(BaseModel):
+    name: str = ""
+    role: str = ""
+    quote: Optional[str] = None
+    image: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
 class HomepageSection(BaseModel):
     hero_title: Optional[str] = None
     hero_subtitle: Optional[str] = None
@@ -22,8 +32,12 @@ class HomepageSection(BaseModel):
     courses_subtitle: Optional[str] = None
     testimonials_title: Optional[str] = None
     testimonials_subtitle: Optional[str] = None
+    testimonials: Optional[List[TestimonialItem]] = None
     cta_title: Optional[str] = None
     cta_subtitle: Optional[str] = None
+    # Registration flow media (left side image/video/gif)
+    registration_media_url: Optional[str] = None
+    registration_media_type: Optional[str] = None
 
 
 class FooterContent(BaseModel):

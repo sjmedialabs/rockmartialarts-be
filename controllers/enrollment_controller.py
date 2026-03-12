@@ -179,8 +179,16 @@ class EnrollmentController:
         if existing_enrollment:
             raise HTTPException(status_code=400, detail="Student already enrolled in this course.")
 
-        # Determine fee_amount based on branch pricing
-        admission_fee = 500.0  # Fixed admission fee
+        # Determine fee_amount based on branch pricing and branch-specific admission fee
+        admission_fee = 500.0
+        try:
+            branch_adm = branch.get("admission_fee")
+            if isinstance(branch_adm, (int, float)):
+                admission_fee = float(branch_adm)
+        except Exception:
+            pass
+
+        # Base course fee (can be overridden by branch_pricing)
         fee_amount = course["base_fee"]
         if enrollment_data.branch_id in course.get("branch_pricing", {}):
             fee_amount = course["branch_pricing"][enrollment_data.branch_id]

@@ -6,7 +6,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from pathlib import Path
 
-from models.superadmin_models import SuperAdmin, SuperAdminRegister, SuperAdminLogin, SuperAdminResponse
+from models.superadmin_models import SuperAdmin, SuperAdminRegister, SuperAdminLogin, SuperAdminResponse, BulkImportStudentsRequest, BulkImportStudentRow
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.email_service import send_password_reset_email
@@ -291,3 +291,131 @@ class SuperAdminController:
             raise HTTPException(status_code=404, detail="Superadmin not found")
 
         return {"message": "Password has been reset successfully"}
+
+    @staticmethod
+    async def bulk_import_students(body: BulkImportStudentsRequest):
+        """Import multiple students from CSV/Excel. Validates branches (and courses). Supports payment fields for reminders."""
+        from datetime import datetime
+        from controllers.auth_controller import AuthController
+        from models.user_models import UserCreate, UserRole, CourseInfo, BranchInfo
+        from models.enrollment_models import PaymentStatus
+        from models.payment_models import Payment, PaymentType, PaymentMethod, PaymentStatus as PayStatus
+
+        db = get_db()
+        if not body.students:
+            raise HTTPException(status_code=400, detail="No students to import")
+
+        branch_ids = list({r.branch_id for r in body.students})
+        branches = await db.branches.find({"id": {"$in": branch_ids}}).to_list(length=len(branch_ids))
+        branch_map = {b["id"]: b for b in branches}
+        missing_branches = [bid for bid in branch_ids if bid not in branch_map]
+        if missing_branches:
+            raise HTTPException(status_code=400, detail=f"Invalid or missing branch_id(s): {', '.join(missing_branches)}")
+
+        course_ids = list({r.course_id for r in body.students if r.course_id})
+        course_map = {}
+        if course_ids:
+            courses = await db.courses.find({"id": {"$in": course_ids}}).to_list(length=len(course_ids))
+            course_map = {c["id"]: c for c in courses}
+            missing_courses = [cid for cid in course_ids if cid not in course_map]
+            if missing_courses:
+                raise HTTPException(status_code=400, detail=f"Invalid or missing course_id(s): {', '.join(missing_courses)}")
+
+        created = 0
+        errors = []
+        for i, row in enumerate(body.students):
+            try:
+                branch = branch_map.get(row.branch_id)
+                location_id = (branch or {}).get("location_id") or ""
+                course = None
+                branch_info = BranchInfo(location_id=location_id, branch_id=row.branch_id)
+                if row.course_id and course_map.get(row.course_id):
+                    course = CourseInfo(
+                        category_id=row.category_id or "",
+                        course_id=row.course_id,
+                        duration=row.duration or "3-months"
+                    )
+                dob = None
+                if row.date_of_birth:
+                    try:
+                        from datetime import date
+                        parts = row.date_of_birth.strip().split("-")
+                        if len(parts) >= 3:
+                            dob = date(int(parts[0]), int(parts[1]), int(parts[2]))
+                    except Exception:
+                        pass
+                user_data = UserCreate(
+                    email=row.email,
+                    phone=row.phone,
+                    first_name=row.first_name,
+                    last_name=row.last_name,
+                    role=UserRole.STUDENT,
+                    password=None,
+                    date_of_birth=dob,
+                    gender=row.gender,
+                    branch_id=row.branch_id,
+                    course=course,
+                    branch=branch_info
+                )
+                result = await AuthController.create_user_silent(user_data)
+                student_id = result["user_id"]
+                enrollment_id = result.get("enrollment_id")
+
+                if enrollment_id and (row.next_payment_due or row.amount_paid is not None or row.last_payment_date):
+                    next_due = None
+                    if row.next_payment_due:
+                        try:
+                            parts = row.next_payment_due.strip().split("-")
+                            if len(parts) >= 3:
+                                next_due = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                        except Exception:
+                            pass
+                    payment_date = None
+                    if row.last_payment_date:
+                        try:
+                            parts = row.last_payment_date.strip().split("-")
+                            if len(parts) >= 3:
+                                payment_date = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                        except Exception:
+                            pass
+                    if row.amount_paid is not None and row.amount_paid > 0:
+                        if not payment_date:
+                            payment_date = datetime.utcnow()
+                        if not next_due:
+                            from datetime import timedelta
+                            next_due = payment_date + timedelta(days=30)
+                    update_fields = {}
+                    if next_due is not None:
+                        update_fields["next_due_date"] = next_due
+                    if row.amount_paid is not None and row.amount_paid > 0:
+                        update_fields["payment_status"] = PaymentStatus.PAID.value
+                    if update_fields:
+                        await db.enrollments.update_one(
+                            {"id": enrollment_id},
+                            {"$set": update_fields}
+                        )
+                    if row.amount_paid is not None and row.amount_paid > 0:
+                        due_dt = next_due or datetime.utcnow()
+                        payment = Payment(
+                            student_id=student_id,
+                            enrollment_id=enrollment_id,
+                            amount=row.amount_paid,
+                            payment_type=PaymentType.COURSE_FEE,
+                            payment_method=PaymentMethod.CASH,
+                            payment_status=PayStatus.PAID,
+                            payment_date=payment_date,
+                            due_date=due_dt
+                        )
+                        await db.payments.insert_one(payment.dict())
+                created += 1
+            except HTTPException as e:
+                errors.append({"row": i + 1, "email": row.email, "error": e.detail})
+            except Exception as e:
+                errors.append({"row": i + 1, "email": row.email, "error": str(e)})
+
+        return {
+            "message": f"Imported {created} student(s).",
+            "created": created,
+            "total": len(body.students),
+            "errors": errors
+        }

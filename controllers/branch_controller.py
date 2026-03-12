@@ -191,6 +191,7 @@ class BranchController:
                 "location_id": branch.get("location_id"),
                 "manager_id": branch.get("manager_id"),
                 "is_active": branch.get("is_active", True),
+                "admission_fee": branch.get("admission_fee", 500.0),
                 "operational_details": {
                     "timings": operational.get("timings", []),
                     "courses_offered": operational.get("courses_offered", []),

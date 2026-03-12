@@ -158,7 +158,15 @@ class PaymentController:
 
             pricing_multiplier = duration_info.get("pricing_multiplier", 1.0) if duration_info else 1.0
             duration_name = duration_info.get("name", duration) if duration_info else duration
-            admission_fee = 500.0  # Fixed admission fee
+
+            # Branch-specific admission fee (fallback to 500)
+            admission_fee = 500.0
+            try:
+                branch_adm = branch.get("admission_fee")
+                if isinstance(branch_adm, (int, float)):
+                    admission_fee = float(branch_adm)
+            except Exception:
+                pass
             course_fee = None
             total_amount = None
 

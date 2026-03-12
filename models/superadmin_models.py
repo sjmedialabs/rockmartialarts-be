@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import uuid
 
 class SuperAdmin(BaseModel):
@@ -43,3 +43,24 @@ class SuperAdminForgotPassword(BaseModel):
 class SuperAdminResetPassword(BaseModel):
     token: str
     new_password: str
+
+
+class BulkImportStudentRow(BaseModel):
+    """One row for bulk import. branch_id required; course optional. Payment fields for reminders."""
+    first_name: str
+    last_name: str
+    email: EmailStr
+    phone: str
+    branch_id: str
+    course_id: Optional[str] = None
+    category_id: Optional[str] = None
+    duration: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    last_payment_date: Optional[str] = None  # ISO date (YYYY-MM-DD)
+    next_payment_due: Optional[str] = None  # ISO date – used for email/SMS/WhatsApp reminders
+    amount_paid: Optional[float] = None  # If set, mark enrollment as paid and create payment record
+
+
+class BulkImportStudentsRequest(BaseModel):
+    students: List[BulkImportStudentRow]

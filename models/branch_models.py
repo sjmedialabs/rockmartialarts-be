@@ -46,6 +46,7 @@ class Branch(BaseModel):
     operational_details: OperationalDetails
     assignments: Assignments
     bank_details: BankDetails
+    admission_fee: float = 500.0
     is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -57,6 +58,7 @@ class BranchCreate(BaseModel):
     operational_details: OperationalDetails
     assignments: Assignments
     bank_details: BankDetails
+    admission_fee: float = 500.0
 
 class BranchUpdate(BaseModel):
     branch: Optional[BranchInfo] = None
@@ -65,4 +67,5 @@ class BranchUpdate(BaseModel):
     operational_details: Optional[OperationalDetails] = None
     assignments: Optional[Assignments] = None
     bank_details: Optional[BankDetails] = None
+    admission_fee: Optional[float] = None
     is_active: Optional[bool] = None

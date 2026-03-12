@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from controllers.superadmin_controller import SuperAdminController
 from controllers.coach_controller import CoachController
-from models.superadmin_models import SuperAdminRegister, SuperAdminLogin, SuperAdminUpdate, SuperAdminForgotPassword, SuperAdminResetPassword
+from models.superadmin_models import SuperAdminRegister, SuperAdminLogin, SuperAdminUpdate, SuperAdminForgotPassword, SuperAdminResetPassword, BulkImportStudentsRequest
 from models.coach_models import CoachCreate, CoachUpdate
 
 router = APIRouter()
@@ -159,3 +159,12 @@ async def get_coach_stats_as_superadmin(
 ):
     """Get coach statistics (Super Admin only)"""
     return await CoachController.get_coach_stats()
+
+
+@router.post("/students/bulk-import", status_code=status.HTTP_201_CREATED)
+async def bulk_import_students(
+    body: BulkImportStudentsRequest,
+    current_admin=Depends(get_current_superadmin)
+):
+    """Bulk import existing students from CSV/Excel. Supports payment and next-due fields for reminders."""
+    return await SuperAdminController.bulk_import_students(body)
