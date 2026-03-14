@@ -40,6 +40,7 @@ from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
 from routes.upload_routes import router as upload_router
 from routes.cms_routes import router as cms_router
+from routes.achievement_routes import router as achievement_router
 
 # Import database utility
 from utils.database import db
@@ -128,6 +129,7 @@ app.include_router(attendance_router, prefix="/api/attendance", tags=["Attendanc
 app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches with Courses"])
 app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
+app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
 
 @app.get("/")
 async def root():
