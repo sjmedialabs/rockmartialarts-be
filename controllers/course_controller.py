@@ -1,5 +1,5 @@
 from fastapi import HTTPException, Depends
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 from models.course_models import CourseCreate, CourseUpdate, Course
@@ -9,6 +9,18 @@ from utils.database import get_db
 from utils.helpers import serialize_doc
 
 class CourseController:
+    @staticmethod
+    def _attach_public_about_fields(course_dict: Dict[str, Any]) -> None:
+        """Flatten page_content.about_section for public APIs (aboutTitle, aboutDescription)."""
+        page_content = course_dict.get("page_content") or {}
+        about = page_content.get("about_section") or {}
+        if not isinstance(about, dict):
+            about = {}
+        course_dict["aboutTitle"] = str(about.get("title") or about.get("aboutTitle") or "").strip()
+        course_dict["aboutDescription"] = str(
+            about.get("description") or about.get("aboutDescription") or ""
+        ).strip()
+
     @staticmethod
     async def create_course(
         course_data: CourseCreate,
@@ -491,6 +503,7 @@ class CourseController:
                 "icon": "🥋",  # Default icon for martial arts courses
                 "enabled": course.get("settings", {}).get("active", True)
             })
+            CourseController._attach_public_about_fields(enhanced_course)
 
             enhanced_courses.append(enhanced_course)
 
@@ -588,8 +601,12 @@ class CourseController:
             for b in branches
         ]
 
+        serialized_course = serialize_doc(course)
+        CourseController._attach_public_about_fields(serialized_course)
+        serialized_course.pop("description", None)
+
         return {
-            "course": serialize_doc(course),
+            "course": serialized_course,
             "statistics": statistics,
             "curriculum": curriculum,
             "enrolled_students": enrolled_students,
