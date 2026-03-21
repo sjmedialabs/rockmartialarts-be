@@ -35,6 +35,9 @@ class HomepageSection(BaseModel):
     testimonials: Optional[List[TestimonialItem]] = None
     cta_title: Optional[str] = None
     cta_subtitle: Optional[str] = None
+    # CTA section below testimonials (separate from the tagline below hero)
+    bottom_cta_title: Optional[str] = None
+    bottom_cta_subtitle: Optional[str] = None
     # Registration flow media (left side image/video/gif)
     registration_media_url: Optional[str] = None
     registration_media_type: Optional[str] = None

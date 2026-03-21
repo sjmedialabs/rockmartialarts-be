@@ -68,6 +68,7 @@ class Course(BaseModel):
     media_resources: MediaResources
     pricing: Pricing
     settings: Settings
+    # Public course page: hero_section (bullet_points[]), about_section (content_blocks: [{ title, description, bullet_points[], image? }]), etc.
     page_content: Optional[Dict[str, Any]] = None
     seo: Optional[CourseSEO] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)

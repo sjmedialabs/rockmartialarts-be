@@ -506,6 +506,157 @@ class CourseController:
         }
 
     @staticmethod
+    async def get_public_course_detail(course_id: str):
+        """Public: full course detail with statistics, curriculum, enrolled students, reviews, student achievements."""
+        db = get_db()
+        course = await db.courses.find_one({"id": course_id, "settings.active": True})
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+
+        # Statistics
+        branches = await db.branches.find({
+            "assignments.courses": course_id,
+            "is_active": True
+        }).to_list(length=100)
+        instructors = await db.coaches.find({
+            "assignment_details.courses": course_id,
+            "is_active": True
+        }).to_list(length=100)
+        enrollment_count = await db.enrollments.count_documents({
+            "course_id": course_id,
+            "is_active": True
+        })
+        statistics = {
+            "enrolled_count": enrollment_count,
+            "branches_count": len(branches),
+            "instructors_count": len(instructors),
+        }
+
+        # Curriculum from course_content.syllabus (split into lines)
+        course_content = course.get("course_content") or {}
+        syllabus_text = course_content.get("syllabus") or ""
+        curriculum = [s.strip() for s in syllabus_text.split("\n") if s.strip()] if syllabus_text else []
+
+        # Enrolled students (limit 24 for display)
+        enrollments = await db.enrollments.find(
+            {"course_id": course_id, "is_active": True}
+        ).limit(24).to_list(length=24)
+        student_ids = list({e["student_id"] for e in enrollments})
+        users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids))
+        user_map = {u["id"]: u for u in users}
+        enrolled_students = []
+        for sid in student_ids:
+            u = user_map.get(sid)
+            if not u:
+                continue
+            enrolled_students.append({
+                "id": u.get("id"),
+                "first_name": u.get("first_name", ""),
+                "last_name": u.get("last_name", ""),
+                "full_name": (u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Student"),
+                "photo": u.get("photo") or u.get("profile_photo") or u.get("profile_image"),
+            })
+
+        # Student reviews = testimonials from page_content
+        page_content = course.get("page_content") or {}
+        student_reviews = page_content.get("testimonials") or []
+
+        # Student achievements: achievements of students enrolled in this course
+        all_enrollment_cursor = await db.enrollments.find(
+            {"course_id": course_id, "is_active": True}
+        ).to_list(length=500)
+        all_student_ids = list({e["student_id"] for e in all_enrollment_cursor})
+        achievements_cursor = db.student_achievements.find({
+            "student_id": {"$in": all_student_ids},
+            "is_deleted": False
+        }).sort("created_at", -1).limit(30)
+        achievement_docs = await achievements_cursor.to_list(length=30)
+        ach_user_ids = list({a["student_id"] for a in achievement_docs})
+        ach_users = await db.users.find({"id": {"$in": ach_user_ids}}).to_list(length=len(ach_user_ids))
+        ach_user_map = {u["id"]: (u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Student") for u in ach_users}
+        student_achievements = []
+        for a in achievement_docs:
+            d = serialize_doc(a)
+            d["student_name"] = ach_user_map.get(a["student_id"], "Student")
+            student_achievements.append(d)
+
+        branches_offering = [
+            {
+                "id": b["id"],
+                "name": (b.get("branch") or {}).get("name") or b.get("name") or "Branch",
+            }
+            for b in branches
+        ]
+
+        return {
+            "course": serialize_doc(course),
+            "statistics": statistics,
+            "curriculum": curriculum,
+            "enrolled_students": enrolled_students,
+            "student_reviews": student_reviews,
+            "student_achievements": student_achievements,
+            "branches_offering": branches_offering,
+        }
+
+    @staticmethod
+    async def get_public_course_branch_info(course_id: str, branch_id: str):
+        """Public: for course detail page - get duration, price, timings for a selected branch."""
+        db = get_db()
+        course = await db.courses.find_one({"id": course_id, "settings.active": True})
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+        branch = await db.branches.find_one({"id": branch_id, "is_active": True})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        course_ids = (branch.get("assignments") or {}).get("courses") or []
+        if course_id not in course_ids:
+            raise HTTPException(status_code=400, detail="Course not offered at this branch")
+
+        branch_name = (branch.get("branch") or {}).get("name") or branch.get("name") or "Branch"
+        timings_list = (branch.get("operational_details") or {}).get("timings") or []
+        timings_display = "—"
+        if timings_list:
+            parts = []
+            for t in timings_list[:3]:
+                open_t = t.get("open", "")
+                close_t = t.get("close", "")
+                day = t.get("day", "")
+                if open_t and close_t:
+                    parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
+            timings_display = " | ".join(parts) if parts else (f"{timings_list[0].get('open', '')} to {timings_list[0].get('close', '')}" if timings_list else "—")
+
+        durations = await db.durations.find({"is_active": True}).sort("display_order", 1).limit(20).to_list(length=20)
+        duration_display = "—"
+        if durations:
+            first_d = durations[0]
+            duration_display = first_d.get("name") or f"{first_d.get('duration_months', 1)} month(s)"
+
+        pricing = course.get("pricing") or {}
+        branch_prices = pricing.get("branch_prices") or []
+        branch_entry = next((b for b in branch_prices if b.get("branch_id") == branch_id), None)
+        amount = None
+        if branch_entry:
+            amount = branch_entry.get("amount") or branch_entry.get("fee_1_month") or branch_entry.get("fee_1_year")
+            fee_per_duration = branch_entry.get("fee_per_duration")
+            if amount is None and fee_per_duration and isinstance(fee_per_duration, dict):
+                vals = [v for v in fee_per_duration.values() if v is not None]
+                amount = vals[0] if vals else None
+        if amount is None:
+            amount = pricing.get("amount") or pricing.get("fee_1_month") or pricing.get("fee_1_year")
+        currency = (branch_entry or {}).get("currency") or pricing.get("currency", "INR")
+        price_display = f"{currency} {amount}" if amount is not None else "—"
+        if currency == "INR":
+            price_display = f"₹ {amount}" if amount is not None else "—"
+
+        return {
+            "branch_id": branch_id,
+            "branch_name": branch_name,
+            "duration": duration_display,
+            "price_display": price_display,
+            "timings": timings_display,
+        }
+
+    @staticmethod
     async def get_public_courses_by_branch(branch_id: str):
         """Get courses assigned to a branch with details and fees - Public (no auth)."""
         db = get_db()

@@ -84,6 +84,18 @@ async def get_public_courses(
     """Get all courses - Public endpoint (no authentication required)"""
     return await CourseController.get_public_courses(active_only, skip, limit)
 
+@router.get("/public/detail/{course_id}")
+async def get_public_course_detail(course_id: str):
+    """Get full course detail with statistics, curriculum, enrolled students, reviews, achievements, branches_offering - Public (no auth)."""
+    return await CourseController.get_public_course_detail(course_id)
+
+
+@router.get("/public/detail/{course_id}/branch-info")
+async def get_public_course_branch_info(course_id: str, branch_id: str = Query(..., description="Branch ID")):
+    """Get duration, price, timings for a course at a specific branch - Public (no auth)."""
+    return await CourseController.get_public_course_branch_info(course_id, branch_id)
+
+
 @router.get("/public/by-branch/{branch_id}")
 async def get_public_courses_by_branch(branch_id: str):
     """Get courses at a branch with details and fees - Public (no auth)."""
