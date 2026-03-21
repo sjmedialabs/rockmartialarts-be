@@ -10,6 +10,18 @@ from utils.unified_auth import require_role_unified, get_current_user_or_superad
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms, send_whatsapp
 
+
+def _enrollment_date_to_iso(val):
+    """Serialize enrollment start/end dates for API JSON (Mongo datetime or ISO string)."""
+    if val is None:
+        return None
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    if isinstance(val, str):
+        return val
+    return str(val)
+
+
 class UserController:
     @staticmethod
     async def create_user(
@@ -81,6 +93,11 @@ class UserController:
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        # Admin-created students should use onboarding link until they complete it (not website self-registration)
+        if user_data.role == UserRole.STUDENT:
+            user_dict["has_credentials"] = False
+        else:
+            user_dict["has_credentials"] = True
 
         # Set branch_id for staff members
         if user_data.branch_id:
@@ -225,7 +242,13 @@ class UserController:
             filter_query["branch_id"] = branch_id
         
         db = get_db()
-        users = await db.users.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
+        users = await (
+            db.users.find(filter_query)
+            .sort("created_at", -1)
+            .skip(skip)
+            .limit(limit)
+            .to_list(length=limit)
+        )
         total_count = await db.users.count_documents(filter_query)
         
         for user in users:
@@ -781,7 +804,7 @@ class UserController:
                 return {"message": "No students found", "students": [], "total": 0}
             assigned_student_ids = await db.enrollments.distinct("student_id", {"is_active": True})
             query = {"role": "student", "is_active": True, "id": {"$nin": assigned_student_ids}}
-            students_cursor = db.users.find(query)
+            students_cursor = db.users.find(query).sort("created_at", -1)
             students = await students_cursor.to_list(1000)
             if not students:
                 return {"message": "No unassigned students found", "students": [], "total": 0}
@@ -819,14 +842,22 @@ class UserController:
                     "date_of_birth": student.get("date_of_birth"),
                     "is_active": student.get("is_active", True),
                     "created_at": student.get("created_at"),
+                    "has_credentials": bool(student.get("has_credentials", True)),
+                    "start_date": None,
+                    "end_date": None,
                     "branch_id": None,
                     "branch_info": None,
                     "courses": [],
                     "course_info": None,
                 })
-            return {"message": "Unassigned students", "students": enriched_students, "total": len(enriched_students)}
+            return {
+                "message": "Unassigned students",
+                "students": serialize_doc(enriched_students),
+                "total": len(enriched_students),
+            }
 
         # Build query based on user role (normal listing)
+        # Same users collection as public registration; website students have role "student" and is_active True
         query = {"role": "student", "is_active": True}
 
         # Apply branch filtering for non-super-admin users
@@ -881,8 +912,8 @@ class UserController:
                     raise HTTPException(status_code=403, detail="User not assigned to any branch")
                 query["branch_id"] = user_branch_id
 
-        # Get students
-        students_cursor = db.users.find(query)
+        # Get students (newest first)
+        students_cursor = db.users.find(query).sort("created_at", -1)
         students = await students_cursor.to_list(1000)
 
         if not students:
@@ -943,7 +974,11 @@ class UserController:
             courses_info = []
 
             # Method 1: Check for enrollments in enrollments collection
-            enrollments = await db.enrollments.find({"student_id": student_id, "is_active": True}).to_list(100)
+            enrollments = await (
+                db.enrollments.find({"student_id": student_id, "is_active": True})
+                .sort("enrollment_date", -1)
+                .to_list(100)
+            )
 
             for enrollment in enrollments:
                 course = await db.courses.find_one({"id": enrollment["course_id"]})
@@ -1028,6 +1063,10 @@ class UserController:
                         "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch")
                     }
 
+            primary_enrollment = enrollments[0] if enrollments else None
+            start_date_out = _enrollment_date_to_iso(primary_enrollment.get("start_date")) if primary_enrollment else None
+            end_date_out = _enrollment_date_to_iso(primary_enrollment.get("end_date")) if primary_enrollment else None
+
             # Prepare student details response
             student_details = {
                 "id": student_id,
@@ -1044,6 +1083,9 @@ class UserController:
                 "date_of_birth": student.get("date_of_birth"),
                 "is_active": student.get("is_active", True),
                 "created_at": student.get("created_at"),
+                "has_credentials": bool(student.get("has_credentials", True)),
+                "start_date": start_date_out,
+                "end_date": end_date_out,
                 "branch_id": student.get("branch_id"),
                 "branch_info": branch_info_response,
                 "address": student.get("address"),
@@ -1056,7 +1098,7 @@ class UserController:
 
         return {
             "message": f"Retrieved {len(enriched_students)} student details successfully",
-            "students": enriched_students,
+            "students": serialize_doc(enriched_students),
             "total": len(enriched_students)
         }
 

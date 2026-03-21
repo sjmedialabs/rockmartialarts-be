@@ -26,6 +26,7 @@ from .message_routes import router as message_router
 from .dropdown_settings_routes import router as dropdown_settings_router
 from .upload_routes import router as upload_router
 from .cms_routes import router as cms_router
+from .lead_routes import router as lead_router
 
 __all__ = [
     'auth_router',
@@ -53,5 +54,6 @@ __all__ = [
     'message_router',
     'dropdown_settings_router',
     'upload_router',
-    'cms_router'
+    'cms_router',
+    'lead_router'
 ]

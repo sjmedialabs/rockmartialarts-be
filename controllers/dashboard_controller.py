@@ -1,5 +1,5 @@
 from fastapi import HTTPException
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from utils.database import get_db
 from utils.helpers import serialize_doc
@@ -44,7 +44,9 @@ class DashboardController:
                     "pending_payments": 0,
                     "today_attendance": 0,
                     "total_coaches": 0,
-                    "active_coaches": 0
+                    "active_coaches": 0,
+                    "students_registered_in_period": 0,
+                    "courses_with_enrollments_in_period": 0,
                 }}
 
             # Get all branch IDs managed by this branch manager
@@ -311,6 +313,51 @@ class DashboardController:
                     **filter_query
                 })
             stats["today_attendance"] = today_attendance
+
+            # Period-scoped metrics (for time-range filters on the dashboard UI)
+            period_start, period_end = _parse_dashboard_period(start_date, end_date)
+            if period_start and period_end:
+                if current_user["role"] == "branch_manager":
+                    managed_branch_ids = filter_query.get("branch_id", {}).get("$in", [])
+                    if managed_branch_ids:
+                        enr_q = {
+                            "branch_id": {"$in": managed_branch_ids},
+                            "is_active": True,
+                            "$or": [
+                                {"created_at": {"$gte": period_start, "$lte": period_end}},
+                                {"enrollment_date": {"$gte": period_start, "$lte": period_end}},
+                            ],
+                        }
+                        reg_ids = await db.enrollments.distinct("student_id", enr_q)
+                        stats["students_registered_in_period"] = len(reg_ids)
+                        course_ids = await db.enrollments.distinct("course_id", enr_q)
+                        stats["courses_with_enrollments_in_period"] = len(course_ids)
+                    else:
+                        stats["students_registered_in_period"] = 0
+                        stats["courses_with_enrollments_in_period"] = 0
+                else:
+                    uq = {
+                        "role": "student",
+                        "is_active": True,
+                        "created_at": {"$gte": period_start, "$lte": period_end},
+                    }
+                    if filter_query.get("branch_id"):
+                        uq["branch_id"] = filter_query["branch_id"]
+                    stats["students_registered_in_period"] = await db.users.count_documents(uq)
+                    enr_q = {
+                        "is_active": True,
+                        "$or": [
+                            {"created_at": {"$gte": period_start, "$lte": period_end}},
+                            {"enrollment_date": {"$gte": period_start, "$lte": period_end}},
+                        ],
+                    }
+                    if filter_query.get("branch_id"):
+                        enr_q["branch_id"] = filter_query["branch_id"]
+                    course_ids = await db.enrollments.distinct("course_id", enr_q)
+                    stats["courses_with_enrollments_in_period"] = len(course_ids)
+            else:
+                stats["students_registered_in_period"] = stats.get("active_students", 0)
+                stats["courses_with_enrollments_in_period"] = stats.get("active_courses", 0)
             
             return {"dashboard_stats": stats}
             

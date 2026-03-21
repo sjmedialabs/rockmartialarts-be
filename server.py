@@ -34,7 +34,8 @@ from routes import (
     reports_router,
     attendance_router,
     message_router,
-    dropdown_settings_router
+    dropdown_settings_router,
+    lead_router,
 )
 from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
@@ -123,6 +124,7 @@ app.include_router(search_router, prefix="/api/search", tags=["Search"])
 app.include_router(email_router, prefix="/api/email", tags=["Email"])
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
+app.include_router(lead_router, prefix="/api/leads", tags=["Leads"])
 app.include_router(dropdown_settings_router, prefix="/api/dropdown-settings", tags=["Master Data"])
 app.include_router(message_router, prefix="/api/messages", tags=["Messages"])
 app.include_router(reports_router, prefix="/api/reports", tags=["Reports"])

@@ -150,6 +150,7 @@ class OnboardingController:
             "first_name": (data.get("first_name") or "").strip() or user.get("first_name", ""),
             "last_name": (data.get("last_name") or "").strip() or user.get("last_name", ""),
             "full_name": full_name,
+            "has_credentials": True,
             "updated_at": _utc_now(),
         }
         if data.get("date_of_birth") is not None:

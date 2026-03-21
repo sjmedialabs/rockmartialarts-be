@@ -128,6 +128,9 @@ class SystemSettingsFlatCreate(BaseModel):
     backup_frequency: Literal["daily", "weekly", "monthly"] = Field(default="daily")
     backup_retention: str = Field(default="30")
 
+    # Pricing (public registration / admission default when branch has no override)
+    registration_fee: float = Field(default=500.0, ge=0, description="Default registration fee (INR)")
+
     @validator('smtp_port')
     def validate_smtp_port(cls, v):
         if v and not v.isdigit():
@@ -182,6 +185,8 @@ class SystemSettingsFlatResponse(BaseModel):
     auto_backup: bool
     backup_frequency: str
     backup_retention: str
+
+    registration_fee: float
 
     created_at: datetime
     updated_at: datetime

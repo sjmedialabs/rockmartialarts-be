@@ -58,10 +58,12 @@ async def mark_notification_read(
 
 @router.get("/stats")
 async def get_payment_stats(
+    start_date: Optional[str] = Query(None, description="Period start YYYY-MM-DD (inclusive)"),
+    end_date: Optional[str] = Query(None, description="Period end YYYY-MM-DD (inclusive)"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
 ):
     """Get payment statistics for dashboard - Students get their own payment stats"""
-    return await PaymentController.get_payment_stats(current_user)
+    return await PaymentController.get_payment_stats(current_user, start_date=start_date, end_date=end_date)
 
 @router.get("")
 async def get_payments(
@@ -69,10 +71,14 @@ async def get_payments(
     limit: int = Query(50, ge=1, le=100),
     status: Optional[str] = Query(None),
     payment_type: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
 ):
     """Get payments with filtering - Students can only see their own payments"""
-    return await PaymentController.get_payments(skip, limit, status, payment_type, current_user)
+    return await PaymentController.get_payments(
+        skip, limit, status, payment_type, current_user, start_date=start_date, end_date=end_date
+    )
 
 @router.get("/export")
 async def export_payments(

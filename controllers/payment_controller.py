@@ -13,6 +13,7 @@ from models.notification_models import PaymentNotification, PaymentNotificationC
 from utils.auth import require_role
 from utils.database import get_db
 from utils.helpers import send_whatsapp
+from controllers.settings_controller import SettingsController
 
 class PaymentController:
     @staticmethod
@@ -159,8 +160,8 @@ class PaymentController:
             pricing_multiplier = duration_info.get("pricing_multiplier", 1.0) if duration_info else 1.0
             duration_name = duration_info.get("name", duration) if duration_info else duration
 
-            # Branch-specific admission fee (fallback to 500)
-            admission_fee = 500.0
+            # Default registration fee from Super Admin settings; branch can override
+            admission_fee = await SettingsController.get_default_registration_fee()
             try:
                 branch_adm = branch.get("admission_fee")
                 if isinstance(branch_adm, (int, float)):
@@ -439,7 +440,26 @@ class PaymentController:
         return {"message": "Notification marked as read"}
 
     @staticmethod
-    async def get_payment_stats(current_user: dict = None):
+    def _payment_stats_parse_period(
+        start_date: Optional[str], end_date: Optional[str]
+    ):
+        if not start_date or not end_date:
+            return None, None
+        try:
+            s = datetime.strptime(start_date[:10], "%Y-%m-%d")
+            e = datetime.strptime(end_date[:10], "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+            return s, e
+        except ValueError:
+            return None, None
+
+    @staticmethod
+    async def get_payment_stats(
+        current_user: dict = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
         """Get payment statistics for dashboard"""
         db = get_db()
 
@@ -467,7 +487,11 @@ class PaymentController:
                         "total_collected": 0,
                         "pending_payments": 0,
                         "this_month_collection": 0,
-                        "total_students": 0
+                        "total_students": 0,
+                        "period_payment_count": 0,
+                        "monthly_revenue": 0,
+                        "payment_count": 0,
+                        "average_payment": 0,
                     }
 
                 # Get all branch IDs managed by this branch manager
@@ -489,7 +513,11 @@ class PaymentController:
                         "total_collected": 0,
                         "pending_payments": 0,
                         "this_month_collection": 0,
-                        "total_students": 0
+                        "total_students": 0,
+                        "period_payment_count": 0,
+                        "monthly_revenue": 0,
+                        "payment_count": 0,
+                        "average_payment": 0,
                     }
 
                 # Get assigned branch from coach data
@@ -499,7 +527,11 @@ class PaymentController:
                         "total_collected": 0,
                         "pending_payments": 0,
                         "this_month_collection": 0,
-                        "total_students": 0
+                        "total_students": 0,
+                        "period_payment_count": 0,
+                        "monthly_revenue": 0,
+                        "payment_count": 0,
+                        "average_payment": 0,
                     }
 
                 print(f"Coach {coach_id} has access to branch for payment stats: {assigned_branch}")
@@ -523,21 +555,46 @@ class PaymentController:
         pending_payments_result = await db.payments.aggregate(pending_payments_pipeline).to_list(1)
         pending_payments = pending_payments_result[0]["total"] if pending_payments_result else 0
 
-        # Get this month's collection
-        from datetime import datetime
-        current_month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        this_month_pipeline = [
-            {
-                "$match": {
-                    **base_filter,
-                    "payment_status": PaymentStatus.PAID.value,
-                    "payment_date": {"$gte": current_month_start}
-                }
-            },
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]
-        this_month_result = await db.payments.aggregate(this_month_pipeline).to_list(1)
-        this_month_collection = this_month_result[0]["total"] if this_month_result else 0
+        # Period collection (matches dashboard date filter) vs calendar month fallback
+        period_start, period_end = PaymentController._payment_stats_parse_period(
+            start_date, end_date
+        )
+        if period_start and period_end:
+            period_match = {
+                **base_filter,
+                "payment_status": PaymentStatus.PAID.value,
+                "payment_date": {"$gte": period_start, "$lte": period_end},
+            }
+            period_pipeline = [
+                {"$match": period_match},
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}},
+            ]
+            period_result = await db.payments.aggregate(period_pipeline).to_list(1)
+            this_month_collection = period_result[0]["total"] if period_result else 0
+            period_payment_count = int(period_result[0]["cnt"]) if period_result else 0
+            distinct_students = await db.payments.distinct(
+                "student_id",
+                period_match,
+            )
+            total_students_period = len([x for x in distinct_students if x])
+        else:
+            current_month_start = datetime.utcnow().replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            this_month_pipeline = [
+                {
+                    "$match": {
+                        **base_filter,
+                        "payment_status": PaymentStatus.PAID.value,
+                        "payment_date": {"$gte": current_month_start},
+                    }
+                },
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}},
+            ]
+            this_month_result = await db.payments.aggregate(this_month_pipeline).to_list(1)
+            this_month_collection = this_month_result[0]["total"] if this_month_result else 0
+            period_payment_count = int(this_month_result[0]["cnt"]) if this_month_result else 0
+            total_students_period = None
 
         # Get total students count (for branch managers, count students in their branches)
         if current_user and current_user.get("role") == "branch_manager":
@@ -551,15 +608,37 @@ class PaymentController:
         else:
             total_students = await db.users.count_documents({"role": "student"})
 
+        if total_students_period is not None:
+            display_students_for_period = total_students_period
+        else:
+            display_students_for_period = total_students
+
+        avg_pay = (
+            (this_month_collection / period_payment_count) if period_payment_count else 0
+        )
+
         return {
             "total_collected": total_collected,
             "pending_payments": pending_payments,
             "this_month_collection": this_month_collection,
-            "total_students": total_students
+            "total_students": total_students,
+            "students_with_payments_in_period": display_students_for_period,
+            "period_payment_count": period_payment_count,
+            "monthly_revenue": this_month_collection,
+            "payment_count": period_payment_count,
+            "average_payment": avg_pay,
         }
 
     @staticmethod
-    async def get_payments(skip: int = 0, limit: int = 50, status: str = None, payment_type: str = None, current_user: dict = None):
+    async def get_payments(
+        skip: int = 0,
+        limit: int = 50,
+        status: str = None,
+        payment_type: str = None,
+        current_user: dict = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
         """Get payments with filtering and student information"""
         try:
             db = get_db()
@@ -573,6 +652,10 @@ class PaymentController:
                 filter_query["payment_status"] = status
             if payment_type and payment_type != "all":
                 filter_query["payment_type"] = payment_type
+
+            ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
+            if ps and pe:
+                filter_query["payment_date"] = {"$gte": ps, "$lte": pe}
 
             # Apply role-based filtering
             managed_branch_ids = None

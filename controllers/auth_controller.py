@@ -47,6 +47,8 @@ class AuthController:
             "role": user_data.role.value,  # Convert enum to string
             "biometric_id": user_data.biometric_id,
             "is_active": True,
+            # Self-service registration: student already has login credentials
+            "has_credentials": True,
             "date_of_birth": user_data.date_of_birth.isoformat() if user_data.date_of_birth else None,
             "gender": user_data.gender,
             "password": hashed_password,
@@ -172,6 +174,8 @@ class AuthController:
             "role": user_data.role.value,
             "biometric_id": user_data.biometric_id,
             "is_active": True,
+            # Bulk / silent admin provisioning: invite onboarding until they complete the link
+            "has_credentials": False,
             "date_of_birth": user_data.date_of_birth.isoformat() if user_data.date_of_birth else None,
             "gender": user_data.gender,
             "password": hashed_password,

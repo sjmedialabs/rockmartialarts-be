@@ -153,7 +153,10 @@ class SettingsController:
             # Backup Settings
             "auto_backup": True,
             "backup_frequency": "daily",
-            "backup_retention": "30"
+            "backup_retention": "30",
+
+            # Pricing
+            "registration_fee": 500.0,
         }
     
     @staticmethod
@@ -199,7 +202,9 @@ class SettingsController:
             # Backup Settings
             "auto_backup": flat_data.auto_backup,
             "backup_frequency": flat_data.backup_frequency,
-            "backup_retention": flat_data.backup_retention
+            "backup_retention": flat_data.backup_retention,
+
+            "registration_fee": float(flat_data.registration_fee),
         }
     
     @staticmethod
@@ -236,7 +241,37 @@ class SettingsController:
             auto_backup=serialized_doc.get("auto_backup", True),
             backup_frequency=serialized_doc.get("backup_frequency", "daily"),
             backup_retention=serialized_doc.get("backup_retention", "30"),
+
+            registration_fee=float(serialized_doc.get("registration_fee", 500.0)),
             
             created_at=serialized_doc.get("created_at", datetime.utcnow()),
             updated_at=serialized_doc.get("updated_at", datetime.utcnow())
         )
+
+    @staticmethod
+    async def get_public_registration_settings() -> dict:
+        """Public: default registration fee for checkout (no auth)."""
+        try:
+            db = get_db()
+            doc = await db.system_settings.find_one({})
+            fee = 500.0
+            if doc and doc.get("registration_fee") is not None:
+                try:
+                    fee = float(doc["registration_fee"])
+                except (TypeError, ValueError):
+                    fee = 500.0
+            return {"registrationFee": fee}
+        except Exception:
+            return {"registrationFee": 500.0}
+
+    @staticmethod
+    async def get_default_registration_fee() -> float:
+        """Read registration_fee from system_settings (single document)."""
+        try:
+            db = get_db()
+            doc = await db.system_settings.find_one({})
+            if doc and doc.get("registration_fee") is not None:
+                return float(doc["registration_fee"])
+        except Exception:
+            pass
+        return 500.0

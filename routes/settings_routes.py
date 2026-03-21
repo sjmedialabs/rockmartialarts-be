@@ -6,6 +6,16 @@ from utils.unified_auth import require_role_unified
 
 router = APIRouter()
 
+
+@router.get("/public")
+async def get_public_settings():
+    """
+    Public: registration fee for website checkout (no authentication).
+    Returns: { "registrationFee": number }
+    """
+    return await SettingsController.get_public_registration_settings()
+
+
 @router.get("", response_model=SystemSettingsFlatResponse)
 async def get_system_settings(
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN]))
