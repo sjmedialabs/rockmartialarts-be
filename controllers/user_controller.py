@@ -9,6 +9,7 @@ from utils.auth import hash_password, require_role, get_current_active_user
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms, send_whatsapp
+from utils.enrollment_dates import resolve_enrollment_end_date
 
 
 def _enrollment_date_to_iso(val):
@@ -133,23 +134,29 @@ class UserController:
         if user_data.course and user_data.branch and user_data.role == UserRole.STUDENT:
             try:
                 from models.enrollment_models import Enrollment, PaymentStatus
-                from datetime import timedelta
+
+                start_date = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, user_data.course.duration, start_date
+                )
 
                 # Create enrollment record in the proper collection
                 enrollment = Enrollment(
                     student_id=user_dict["id"],
                     course_id=user_data.course.course_id,
                     branch_id=user_data.branch.branch_id,
-                    start_date=datetime.utcnow(),
-                    end_date=datetime.utcnow() + timedelta(days=365),  # Default 1 year
+                    start_date=start_date,
+                    end_date=end_date,
                     fee_amount=0.0,  # Will be updated when payment is processed
                     admission_fee=0.0,  # Will be updated when payment is processed
                     payment_status=PaymentStatus.PENDING,
-                    enrollment_date=datetime.utcnow(),
+                    enrollment_date=start_date,
                     is_active=True
                 )
 
-                enrollment_result = await db.enrollments.insert_one(enrollment.dict())
+                enrollment_doc = enrollment.dict()
+                enrollment_doc["duration_id"] = user_data.course.duration
+                enrollment_result = await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
 
             except Exception as e:
@@ -398,22 +405,30 @@ class UserController:
                     else:
                         # Create new enrollment record
                         from models.enrollment_models import Enrollment, PaymentStatus
-                        from datetime import timedelta
+
+                        duration_ref = course_data.get("duration")
+                        start_date = datetime.utcnow()
+                        end_date = await resolve_enrollment_end_date(
+                            db, duration_ref, start_date
+                        )
 
                         enrollment = Enrollment(
                             student_id=user_id,
                             course_id=course_id,
                             branch_id=branch_id,
-                            start_date=datetime.utcnow(),
-                            end_date=datetime.utcnow() + timedelta(days=365),
+                            start_date=start_date,
+                            end_date=end_date,
                             fee_amount=0.0,
                             admission_fee=0.0,
                             payment_status=PaymentStatus.PENDING,
-                            enrollment_date=datetime.utcnow(),
+                            enrollment_date=start_date,
                             is_active=True
                         )
 
-                        await db.enrollments.insert_one(enrollment.dict())
+                        enrollment_doc = enrollment.dict()
+                        if duration_ref:
+                            enrollment_doc["duration_id"] = duration_ref
+                        await db.enrollments.insert_one(enrollment_doc)
                         print(f"✅ Created new enrollment: {enrollment.id}")
 
                         # Deactivate other enrollments for this student
@@ -994,6 +1009,13 @@ class UserController:
                             end_date = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
                         duration_days = (end_date - start_date).days
 
+                    duration_label = None
+                    did = enrollment.get("duration_id")
+                    if did:
+                        ddoc = await db.durations.find_one({"id": did})
+                        if ddoc:
+                            duration_label = ddoc.get("name") or ddoc.get("code")
+
                     # Determine level from course difficulty
                     level = course.get("difficulty_level", "Beginner")
 
@@ -1001,7 +1023,7 @@ class UserController:
                         "course_id": enrollment["course_id"],
                         "course_name": course.get("title", "Unknown Course"),
                         "level": level,
-                        "duration": f"{duration_days} days" if duration_days else "Not specified",
+                        "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
                         "enrollment_date": enrollment.get("enrollment_date"),
                         "payment_status": enrollment.get("payment_status", "pending"),
                         "branch_id": enrollment.get("branch_id")

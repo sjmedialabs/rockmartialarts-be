@@ -5,11 +5,38 @@ from utils.database import get_db
 from utils.helpers import serialize_doc
 from models.user_models import UserRole
 
+
+def _parse_dashboard_period(
+    start_date: Optional[str], end_date: Optional[str]
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Parse YYYY-MM-DD query params into UTC datetimes (inclusive end-of-day for end_date)."""
+    if not (start_date and str(start_date).strip()) and not (end_date and str(end_date).strip()):
+        return None, None
+    try:
+        if start_date and str(start_date).strip():
+            period_start = datetime.strptime(str(start_date).strip()[:10], "%Y-%m-%d")
+        else:
+            period_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if end_date and str(end_date).strip():
+            period_end = datetime.strptime(str(end_date).strip()[:10], "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+        else:
+            period_end = datetime.utcnow()
+        if period_start > period_end:
+            period_start, period_end = period_end, period_start
+        return period_start, period_end
+    except (ValueError, TypeError):
+        return None, None
+
+
 class DashboardController:
     @staticmethod
     async def get_dashboard_stats(
         current_user: dict,
-        branch_id: Optional[str] = None
+        branch_id: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ):
         """Get comprehensive dashboard statistics"""
         if not current_user:

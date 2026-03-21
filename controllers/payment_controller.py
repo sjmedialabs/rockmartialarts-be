@@ -13,6 +13,7 @@ from models.notification_models import PaymentNotification, PaymentNotificationC
 from utils.auth import require_role
 from utils.database import get_db
 from utils.helpers import send_whatsapp
+from utils.enrollment_dates import resolve_enrollment_end_date
 from controllers.settings_controller import SettingsController
 
 class PaymentController:
@@ -286,20 +287,28 @@ class PaymentController:
             if not enrollment_id:
                 from models.enrollment_models import Enrollment
 
+                start_date = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, payment_data.duration, start_date
+                )
+
                 enrollment = Enrollment(
                     student_id=student_id,
                     course_id=payment_data.course_id,
                     branch_id=payment_data.branch_id,
-                    start_date=datetime.utcnow(),
-                    end_date=datetime.utcnow() + timedelta(days=365),  # Default 1 year
+                    start_date=start_date,
+                    end_date=end_date,
                     fee_amount=payment_info.pricing.course_fee,
                     admission_fee=payment_info.pricing.admission_fee,
                     payment_status="paid",
-                    enrollment_date=datetime.utcnow(),
+                    enrollment_date=start_date,
                     is_active=True
                 )
 
-                await db.enrollments.insert_one(enrollment.dict())
+                enrollment_doc = enrollment.dict()
+                if payment_data.duration:
+                    enrollment_doc["duration_id"] = payment_data.duration
+                await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
 
             # Create payment record with proper enrollment linking

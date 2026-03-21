@@ -12,6 +12,7 @@ from utils.auth import hash_password, verify_password, create_access_token, get_
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms
 from utils.email_service import send_password_reset_email, send_password_reset_email_webhook
+from utils.enrollment_dates import resolve_enrollment_end_date
 
 class AuthController:
     @staticmethod
@@ -90,23 +91,29 @@ class AuthController:
         if user_data.course and user_data.branch and user_data.role == UserRole.STUDENT:
             try:
                 from models.enrollment_models import Enrollment, PaymentStatus
-                from datetime import timedelta
+
+                start_date = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, user_data.course.duration, start_date
+                )
 
                 # Create enrollment record in the proper collection
                 enrollment = Enrollment(
                     student_id=user_dict["id"],
                     course_id=user_data.course.course_id,
                     branch_id=user_data.branch.branch_id,
-                    start_date=datetime.utcnow(),
-                    end_date=datetime.utcnow() + timedelta(days=365),  # Default 1 year
+                    start_date=start_date,
+                    end_date=end_date,
                     fee_amount=0.0,  # Will be updated when payment is processed
                     admission_fee=0.0,  # Will be updated when payment is processed
                     payment_status=PaymentStatus.PENDING,
-                    enrollment_date=datetime.utcnow(),
+                    enrollment_date=start_date,
                     is_active=True
                 )
 
-                enrollment_result = await db.enrollments.insert_one(enrollment.dict())
+                enrollment_doc = enrollment.dict()
+                enrollment_doc["duration_id"] = user_data.course.duration
+                enrollment_result = await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
 
             except Exception as e:
@@ -206,19 +213,25 @@ class AuthController:
         if user_data.course and user_data.branch and user_data.role == UserRole.STUDENT:
             try:
                 from models.enrollment_models import Enrollment, PaymentStatus
+                start_date = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, user_data.course.duration, start_date
+                )
                 enrollment = Enrollment(
                     student_id=user_dict["id"],
                     course_id=user_data.course.course_id,
                     branch_id=user_data.branch.branch_id,
-                    start_date=datetime.utcnow(),
-                    end_date=datetime.utcnow() + timedelta(days=365),
+                    start_date=start_date,
+                    end_date=end_date,
                     fee_amount=0.0,
                     admission_fee=0.0,
                     payment_status=PaymentStatus.PENDING,
-                    enrollment_date=datetime.utcnow(),
+                    enrollment_date=start_date,
                     is_active=True
                 )
-                await db.enrollments.insert_one(enrollment.dict())
+                enrollment_doc = enrollment.dict()
+                enrollment_doc["duration_id"] = user_data.course.duration
+                await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
             except Exception as e:
                 print(f"❌ Error creating enrollment record: {e}")
