@@ -16,6 +16,20 @@ from utils.helpers import send_whatsapp
 from utils.enrollment_dates import resolve_enrollment_end_date
 from controllers.settings_controller import SettingsController
 
+
+def _duration_price_keys(duration: str, duration_info: Optional[dict]) -> list:
+    """Keys to match against fee_per_duration / branch_pricing maps (id, code, or raw query)."""
+    keys: list = []
+    if duration:
+        keys.append(duration)
+    if duration_info:
+        for k in ("id", "code"):
+            v = duration_info.get(k)
+            if v is not None and str(v) not in keys:
+                keys.append(str(v))
+    return keys
+
+
 class PaymentController:
     @staticmethod
     async def student_process_payment(
@@ -161,32 +175,30 @@ class PaymentController:
             pricing_multiplier = duration_info.get("pricing_multiplier", 1.0) if duration_info else 1.0
             duration_name = duration_info.get("name", duration) if duration_info else duration
 
-            # Default registration fee from Super Admin settings; branch can override
+            # Website checkout: registration / admission line item = Super Admin system_settings only.
+            # (Branch admission_fee is for other flows; mixing it caused ₹500 vs settings ₹1 mismatch.)
             admission_fee = await SettingsController.get_default_registration_fee()
-            try:
-                branch_adm = branch.get("admission_fee")
-                if isinstance(branch_adm, (int, float)):
-                    admission_fee = float(branch_adm)
-            except Exception:
-                pass
             course_fee = None
             total_amount = None
 
-            # 1) Branch-specific duration fees (object with "1-month", "3-months", etc.)
+            dur_keys = _duration_price_keys(duration, duration_info)
+
+            # 1) Branch-specific duration fees (dict may use duration id, code, or slug)
             branch_pricing = course.get("branch_pricing") or {}
             bp_val = None
             if branch_id in branch_pricing:
                 bp_val = branch_pricing[branch_id]
-                if isinstance(bp_val, dict) and duration in bp_val and bp_val[duration] is not None:
-                    course_fee = float(bp_val[duration])
-                    total_amount = course_fee + admission_fee
-                    pricing_multiplier = 1.0
-                elif isinstance(bp_val, dict) and bp_val:
-                    # Branch has tenure-specific fees but this duration was not added
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Fee not configured for duration '{duration}' at this branch."
-                    )
+                if isinstance(bp_val, dict):
+                    picked = None
+                    for dk in dur_keys:
+                        if dk in bp_val and bp_val[dk] is not None:
+                            picked = float(bp_val[dk])
+                            break
+                    if picked is not None:
+                        course_fee = picked
+                        total_amount = course_fee + admission_fee
+                        pricing_multiplier = 1.0
+                    # dict but no matching key: fall through to fee_per_duration / legacy (no 404)
                 elif isinstance(bp_val, (int, float)):
                     base_price = float(bp_val)
                     course_fee = base_price * pricing_multiplier
@@ -195,20 +207,19 @@ class PaymentController:
                     bp_val = None
 
             if total_amount is None:
-                # 2) Default fee_per_duration (only tenures added in course add/edit)
+                # 2) Default fee_per_duration
                 fee_per_duration = course.get("fee_per_duration") or {}
-                if duration in fee_per_duration and fee_per_duration[duration] is not None:
-                    course_fee = float(fee_per_duration[duration])
+                picked_fd = None
+                for dk in dur_keys:
+                    if dk in fee_per_duration and fee_per_duration[dk] is not None:
+                        picked_fd = float(fee_per_duration[dk])
+                        break
+                if picked_fd is not None:
+                    course_fee = picked_fd
                     total_amount = course_fee + admission_fee
                     pricing_multiplier = 1.0
-                elif fee_per_duration:
-                    # Tenures are configured but this duration was not added – do not return a price
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Fee not configured for duration '{duration}'. Only added tenures are available."
-                    )
                 else:
-                    # 3) Legacy: no fee_per_duration, use base_fee * multiplier
+                    # 3) Legacy: base_fee * multiplier (even if maps exist but lack this tenure)
                     base_price = course.get("base_fee")
                     if base_price is None:
                         if course.get("pricing"):
@@ -284,12 +295,14 @@ class PaymentController:
 
             # Create enrollment record first to get enrollment_id
             enrollment_id = user_result.get("enrollment_id")
+            months_hint = payment_data.duration_months
+
             if not enrollment_id:
                 from models.enrollment_models import Enrollment
 
                 start_date = datetime.utcnow()
                 end_date = await resolve_enrollment_end_date(
-                    db, payment_data.duration, start_date
+                    db, payment_data.duration, start_date, months_hint=months_hint
                 )
 
                 enrollment = Enrollment(
@@ -310,6 +323,35 @@ class PaymentController:
                     enrollment_doc["duration_id"] = payment_data.duration
                 await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
+            else:
+                # register_user already inserted enrollment (often with wrong end_date if duration lookup failed)
+                enroll = await db.enrollments.find_one({"id": enrollment_id})
+                if enroll:
+                    st = enroll.get("start_date") or enroll.get("enrollment_date")
+                    if isinstance(st, str):
+                        try:
+                            st = datetime.fromisoformat(st.replace("Z", "+00:00")).replace(tzinfo=None)
+                        except ValueError:
+                            st = datetime.utcnow()
+                    elif isinstance(st, datetime):
+                        st = st.replace(tzinfo=None) if st.tzinfo else st
+                    else:
+                        st = datetime.utcnow()
+                    end_date = await resolve_enrollment_end_date(
+                        db, payment_data.duration, st, months_hint=months_hint
+                    )
+                    await db.enrollments.update_one(
+                        {"id": enrollment_id},
+                        {
+                            "$set": {
+                                "end_date": end_date,
+                                "fee_amount": payment_info.pricing.course_fee,
+                                "admission_fee": payment_info.pricing.admission_fee,
+                                "payment_status": PaymentStatus.PAID.value,
+                                "duration_id": payment_data.duration,
+                            }
+                        },
+                    )
 
             # Create payment record with proper enrollment linking
             payment = Payment(

@@ -1,24 +1,50 @@
 """Compute enrollment end dates from duration catalog (id/code) or sensible defaults."""
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
 DEFAULT_ENROLLMENT_DAYS = 365
 
 
+def _parse_months_from_slug(s: str) -> Optional[int]:
+    """Parse strings like 1-month, 3-months, 12m into month count."""
+    if not s or not str(s).strip():
+        return None
+    t = str(s).strip().lower().replace(" ", "")
+    m = re.match(r"^(\d+)[-_]?(month|months|mon|m)$", t)
+    if m:
+        try:
+            n = int(m.group(1))
+            return n if n > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
 async def resolve_enrollment_end_date(
     db,
     duration_ref: Optional[str],
     start_date: datetime,
+    months_hint: Optional[int] = None,
 ) -> datetime:
     """
     Map selected duration (UUID id or code string) to end_date.
-    Uses duration_days when set, else duration_months * 30 (same convention as other controllers).
+    Uses duration_days when set, else duration_months from catalog, else months_hint,
+    else slug patterns (1-month), else DEFAULT_ENROLLMENT_DAYS.
+
+    Duration lookup matches payment pricing: try active record first, then any id/code
+    (strict is_active-only lookup caused 1-month selections to fall back to 365 days).
     """
-    if duration_ref and str(duration_ref).strip():
-        ref = str(duration_ref).strip()
+    ref = str(duration_ref).strip() if duration_ref else ""
+
+    if ref:
         dur = await db.durations.find_one({"id": ref, "is_active": True})
         if not dur:
+            dur = await db.durations.find_one({"id": ref})
+        if not dur:
             dur = await db.durations.find_one({"code": ref, "is_active": True})
+        if not dur:
+            dur = await db.durations.find_one({"code": ref})
         if dur:
             dd = dur.get("duration_days")
             if dd is not None:
@@ -36,4 +62,17 @@ async def resolve_enrollment_end_date(
                         return start_date + timedelta(days=months * 30)
                 except (TypeError, ValueError):
                     pass
+
+    if months_hint is not None:
+        try:
+            mh = int(months_hint)
+            if mh > 0:
+                return start_date + timedelta(days=mh * 30)
+        except (TypeError, ValueError):
+            pass
+
+    slug_months = _parse_months_from_slug(ref)
+    if slug_months:
+        return start_date + timedelta(days=slug_months * 30)
+
     return start_date + timedelta(days=DEFAULT_ENROLLMENT_DAYS)

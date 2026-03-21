@@ -75,6 +75,8 @@ class RegistrationPaymentCreate(BaseModel):
     duration: str
     payment_method: PaymentMethod
     card_details: Optional[Dict[str, str]] = None  # For card payments
+    # From website tenure selector — used when DB duration doc is missing or incomplete
+    duration_months: Optional[int] = None
 
 class RegistrationPaymentResponse(BaseModel):
     payment_id: str

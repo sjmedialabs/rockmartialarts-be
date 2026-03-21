@@ -1,11 +1,15 @@
 from fastapi import HTTPException, status
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import os
 import uuid
 
 from models.lead_models import LeadCreate, LeadResponse
 from utils.database import get_db
 from utils.helpers import serialize_doc
+
+# Must match Next.js default LEAD_CAPTURE_PLACEHOLDER_EMAIL (website popup, no email field)
+_LEAD_EMAIL_PLACEHOLDER = (os.getenv("LEAD_EMAIL_PLACEHOLDER") or "website-popup@example.com").strip().lower()
 
 
 class LeadController:
@@ -14,13 +18,18 @@ class LeadController:
         try:
             db = get_db()
             now = datetime.utcnow()
+            email_raw = (data.email or "").strip().lower() if data.email else ""
+            if email_raw == _LEAD_EMAIL_PLACEHOLDER:
+                email_raw = ""
             doc: Dict[str, Any] = {
                 "id": str(uuid.uuid4()),
                 "name": data.name.strip(),
-                "email": str(data.email).strip().lower(),
+                "email": email_raw,
                 "phone": data.phone.strip(),
                 "course": (data.course or "").strip(),
                 "source": (data.source or "").strip() or None,
+                "branch_id": (data.branch_id or "").strip() or None,
+                "branch_name": (data.branch_name or "").strip() or None,
                 "created_at": now,
             }
             await db.leads.insert_one(doc)
@@ -32,6 +41,8 @@ class LeadController:
                 phone=ser["phone"],
                 course=ser.get("course", ""),
                 source=ser.get("source"),
+                branch_id=ser.get("branch_id"),
+                branch_name=ser.get("branch_name"),
                 created_at=ser.get("created_at", now),
             )
         except Exception as e:
@@ -53,6 +64,8 @@ class LeadController:
                         {"email": {"$regex": s, "$options": "i"}},
                         {"phone": {"$regex": s, "$options": "i"}},
                         {"course": {"$regex": s, "$options": "i"}},
+                        {"branch_name": {"$regex": s, "$options": "i"}},
+                        {"branch_id": {"$regex": s, "$options": "i"}},
                     ]
                 }
             limit = min(max(limit, 1), 200)
@@ -65,10 +78,12 @@ class LeadController:
                     LeadResponse(
                         id=ser["id"],
                         name=ser.get("name", ""),
-                        email=ser.get("email", ""),
+                        email=ser.get("email") or "",
                         phone=ser.get("phone", ""),
                         course=ser.get("course", ""),
                         source=ser.get("source"),
+                        branch_id=ser.get("branch_id"),
+                        branch_name=ser.get("branch_name"),
                         created_at=ser.get("created_at", datetime.utcnow()),
                     )
                 )
