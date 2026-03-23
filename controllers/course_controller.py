@@ -665,12 +665,17 @@ class CourseController:
         if currency == "INR":
             price_display = f"₹ {amount}" if amount is not None else "—"
 
+        branch_fee_per_duration = None
+        if branch_entry and isinstance(branch_entry.get("fee_per_duration"), dict):
+            branch_fee_per_duration = branch_entry.get("fee_per_duration")
+
         return {
             "branch_id": branch_id,
             "branch_name": branch_name,
             "duration": duration_display,
             "price_display": price_display,
             "timings": timings_display,
+            "fee_per_duration": branch_fee_per_duration,
         }
 
     @staticmethod
