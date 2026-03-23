@@ -30,6 +30,43 @@ def _duration_price_keys(duration: str, duration_info: Optional[dict]) -> list:
     return keys
 
 
+def _merge_branch_prices_into_map(course: dict, branch_id: str) -> dict:
+    """
+    Build branch_pricing map from top-level branch_pricing plus pricing.branch_prices[]
+    (same source as public /courses/public/by-branch). Older courses may only have branch_prices.
+    """
+    out: dict = dict(course.get("branch_pricing") or {})
+    if branch_id in out:
+        return out
+    pricing = course.get("pricing") or {}
+    entries = pricing.get("branch_prices") or []
+    entry = next((b for b in entries if b.get("branch_id") == branch_id), None)
+    if not entry:
+        return out
+    fpd = entry.get("fee_per_duration")
+    if isinstance(fpd, dict) and fpd:
+        cleaned = {}
+        for k, v in fpd.items():
+            if v is None:
+                continue
+            try:
+                cleaned[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        if cleaned:
+            out[branch_id] = cleaned
+            return out
+    for key in ("amount", "fee_1_month", "fee_1_year", "fee_3_months", "fee_6_months"):
+        v = entry.get(key)
+        if v is not None:
+            try:
+                out[branch_id] = float(v)
+                return out
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 class PaymentController:
     @staticmethod
     async def student_process_payment(
@@ -184,7 +221,7 @@ class PaymentController:
             dur_keys = _duration_price_keys(duration, duration_info)
 
             # 1) Branch-specific duration fees (dict may use duration id, code, or slug)
-            branch_pricing = course.get("branch_pricing") or {}
+            branch_pricing = _merge_branch_prices_into_map(course, branch_id)
             bp_val = None
             if branch_id in branch_pricing:
                 bp_val = branch_pricing[branch_id]
@@ -231,7 +268,13 @@ class PaymentController:
                         if base_price is None:
                             base_price = course.get("price") or course.get("fee")
                     if base_price is None:
-                        base_price = 15000
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Course fee could not be determined for this branch and duration. "
+                                "Configure branch pricing or fee_per_duration in the admin, or contact support."
+                            ),
+                        )
                     base_price = float(base_price)
                     if branch_id in branch_pricing and isinstance(branch_pricing[branch_id], (int, float)):
                         base_price = float(branch_pricing[branch_id])
