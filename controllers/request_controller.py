@@ -7,8 +7,9 @@ from models.coursechange_models import CourseChangeRequestCreate, CourseChangeRe
 from models.enrollment_models import Enrollment
 from models.user_models import UserRole
 from utils.auth import require_role
-from utils.database import db
+from utils.database import get_db
 from utils.helpers import serialize_doc
+
 
 class RequestController:
     @staticmethod
@@ -17,13 +18,16 @@ class RequestController:
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
         """Create a new transfer request."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         # Determine current_branch_id in a student-friendly way:
         # 1) Prefer explicit current_branch_id from request body
         # 2) Then look up from enrollment_id (if provided)
         # 3) Finally fall back to user's branch_id
         current_branch_id = request_data.current_branch_id
 
-        # If not provided, try to infer from enrollment
         if not current_branch_id and request_data.enrollment_id:
             enrollment = await db.enrollments.find_one({
                 "id": request_data.enrollment_id,
@@ -33,7 +37,6 @@ class RequestController:
             if enrollment:
                 current_branch_id = enrollment.get("branch_id")
 
-        # Fallback: use student's branch_id if still missing
         if not current_branch_id:
             current_branch_id = current_user.get("branch_id")
 
@@ -44,7 +47,8 @@ class RequestController:
             student_id=current_user["id"],
             enrollment_id=request_data.enrollment_id,
             current_branch_id=current_branch_id,
-            **request_data.dict()
+            new_branch_id=request_data.new_branch_id,
+            reason=request_data.reason,
         )
         await db.transfer_requests.insert_one(transfer_request.dict())
         return transfer_request
@@ -52,16 +56,16 @@ class RequestController:
     @staticmethod
     async def get_transfer_requests(
         status: Optional[TransferRequestStatus] = None,
-        current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
+        current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN]))
     ):
-        """Get a list of transfer requests."""
+        """List branch transfer requests — super admin only."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         filter_query = {}
         if status:
             filter_query["status"] = status.value
-
-        if current_user["role"] == UserRole.COACH_ADMIN:
-            # Coach admins can only see requests for their branch
-            filter_query["current_branch_id"] = current_user.get("branch_id")
 
         requests = await db.transfer_requests.find(filter_query).to_list(1000)
         return {"requests": serialize_doc(requests)}
@@ -70,29 +74,49 @@ class RequestController:
     async def update_transfer_request(
         request_id: str,
         update_data: TransferRequestUpdate,
-        current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
+        current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN]))
     ):
-        """Update a transfer request (approve/reject)."""
+        """Approve or reject a branch transfer — super admin only."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         transfer_request = await db.transfer_requests.find_one({"id": request_id})
         if not transfer_request:
             raise HTTPException(status_code=404, detail="Transfer request not found")
 
-        if current_user["role"] == UserRole.COACH_ADMIN:
-            if transfer_request["current_branch_id"] != current_user.get("branch_id"):
-                raise HTTPException(status_code=403, detail="You can only manage requests for your own branch.")
+        status_value = (
+            update_data.status.value
+            if isinstance(update_data.status, TransferRequestStatus)
+            else str(update_data.status)
+        )
 
         updated_request = await db.transfer_requests.find_one_and_update(
             {"id": request_id},
-            {"$set": {"status": update_data.status, "updated_at": datetime.utcnow()}},
+            {"$set": {"status": status_value, "updated_at": datetime.utcnow()}},
             return_document=True
         )
 
-        # If approved, update the student's branch
         if update_data.status == TransferRequestStatus.APPROVED:
-            await db.users.update_one(
-                {"id": transfer_request["student_id"]},
-                {"$set": {"branch_id": transfer_request["new_branch_id"]}}
-            )
+            new_branch_id = transfer_request["new_branch_id"]
+            student_id = transfer_request["student_id"]
+            enrollment_id = transfer_request.get("enrollment_id")
+
+            new_branch = await db.branches.find_one({"id": new_branch_id})
+            location_id = (new_branch or {}).get("location_id")
+
+            user_set = {"branch_id": new_branch_id}
+            if location_id:
+                user_set["branch.location_id"] = location_id
+                user_set["branch.branch_id"] = new_branch_id
+
+            await db.users.update_one({"id": student_id}, {"$set": user_set})
+
+            if enrollment_id:
+                await db.enrollments.update_one(
+                    {"id": enrollment_id, "student_id": student_id},
+                    {"$set": {"branch_id": new_branch_id, "updated_at": datetime.utcnow()}},
+                )
 
         return {"message": "Transfer request updated successfully.", "request": serialize_doc(updated_request)}
 
@@ -102,7 +126,10 @@ class RequestController:
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
         """Create a new course change request."""
-        # Find the current enrollment to ensure it belongs to the student and is active
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         current_enrollment = await db.enrollments.find_one({
             "id": request_data.current_enrollment_id,
             "student_id": current_user["id"],
@@ -111,7 +138,6 @@ class RequestController:
         if not current_enrollment:
             raise HTTPException(status_code=404, detail="Active enrollment not found.")
 
-        # Check if the new course exists
         new_course = await db.courses.find_one({"id": request_data.new_course_id})
         if not new_course:
             raise HTTPException(status_code=404, detail="New course not found.")
@@ -130,6 +156,10 @@ class RequestController:
         current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
     ):
         """Get a list of course change requests."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         filter_query = {}
         if status:
             filter_query["status"] = status.value
@@ -147,6 +177,10 @@ class RequestController:
         current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
     ):
         """Update a course change request (approve/reject)."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         change_request = await db.course_change_requests.find_one({"id": request_id})
         if not change_request:
             raise HTTPException(status_code=404, detail="Course change request not found")
@@ -161,28 +195,21 @@ class RequestController:
             return_document=True
         )
 
-        # If approved, perform the change
         if update_data.status == CourseChangeRequestStatus.APPROVED:
-            # 1. Deactivate old enrollment
             await db.enrollments.update_one(
                 {"id": change_request["current_enrollment_id"]},
                 {"$set": {"is_active": False}}
             )
 
-            # 2. Create new enrollment
             new_course = await db.courses.find_one({"id": change_request["new_course_id"]})
             if not new_course:
-                # This should be rare, but handle it
                 raise HTTPException(status_code=404, detail="New course not found during approval process.")
 
-            # Determine fee for the new course
             fee_amount = new_course.get("base_fee")
             branch_pricing = new_course.get("branch_pricing", {})
             if change_request["branch_id"] in branch_pricing:
                 fee_amount = branch_pricing[change_request["branch_id"]]
 
-            # For simplicity, we'll start a new standard enrollment.
-            # A real-world scenario might involve complex fee calculations.
             new_enrollment = Enrollment(
                 student_id=change_request["student_id"],
                 course_id=change_request["new_course_id"],
@@ -190,7 +217,7 @@ class RequestController:
                 start_date=datetime.utcnow(),
                 end_date=datetime.utcnow() + timedelta(days=new_course["duration_months"] * 30),
                 fee_amount=fee_amount,
-                admission_fee=0  # No new admission fee for a course change
+                admission_fee=0
             )
             await db.enrollments.insert_one(new_enrollment.dict())
 
