@@ -796,6 +796,7 @@ class PaymentController:
                         "payment_date": 1,
                         "course_name": {"$ifNull": ["$course_details.course_name", None]},
                         "branch_name": {"$ifNull": ["$branch_details.branch_name", None]},
+                        "branch_id": {"$ifNull": ["$branch_details.branch_id", None]},
                         "created_at": 1
                     }
                 },

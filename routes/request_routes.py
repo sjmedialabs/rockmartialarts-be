@@ -19,7 +19,7 @@ async def create_transfer_request(
 @router.get("/transfer")
 async def get_transfer_requests(
     status: Optional[TransferRequestStatus] = None,
-    current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
+    current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN]))
 ):
     return await RequestController.get_transfer_requests(status, current_user)
 
@@ -27,7 +27,7 @@ async def get_transfer_requests(
 async def update_transfer_request(
     request_id: str,
     update_data: TransferRequestUpdate,
-    current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]))
+    current_user: dict = Depends(require_role([UserRole.SUPER_ADMIN]))
 ):
     return await RequestController.update_transfer_request(request_id, update_data, current_user)
 
