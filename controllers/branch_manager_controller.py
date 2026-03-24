@@ -379,13 +379,13 @@ class BranchManagerController:
                     branch_info += f" ({branch_location})"
 
         # Prepare email content (same structure as coach credentials email)
-        subject = "Your Branch Manager Login Credentials - Marshalats Academy"
+        subject = "Your Branch Manager Login Credentials - Rock Martial Arts Academy"
 
         # Plain text message
         plain_message = f"""
 Dear {manager_name},
 
-Your Branch Manager account has been created successfully at Marshalats Academy.
+Your Branch Manager account has been created successfully at Rock Martial Arts Academy.
 
 Account Details:
 - Email: {manager_email}
@@ -403,7 +403,7 @@ Once you've set your password, you can log in at:
 If you have any questions or need assistance, please contact our support team.
 
 Best regards,
-Marshalats Academy Team
+Rock Martial Arts Academy Team
 
 This is an automated message. Please do not reply to this email.
         """.strip()
@@ -418,14 +418,14 @@ This is an automated message. Please do not reply to this email.
 </head>
 <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
-        <h1 style="color: white; margin: 0; font-size: 28px;">Welcome to Marshalats Academy</h1>
+        <h1 style="color: white; margin: 0; font-size: 28px;">Welcome to Rock Martial Arts Academy</h1>
         <p style="color: #f0f0f0; margin: 10px 0 0 0; font-size: 16px;">Branch Manager Account Created</p>
     </div>
 
     <div style="background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; border: 1px solid #ddd;">
         <p style="font-size: 16px; margin-bottom: 20px;">Dear <strong>{manager_name}</strong>,</p>
 
-        <p style="font-size: 16px; margin-bottom: 20px;">Your Branch Manager account has been created successfully at Marshalats Academy.</p>
+        <p style="font-size: 16px; margin-bottom: 20px;">Your Branch Manager account has been created successfully at Rock Martial Arts Academy.</p>
 
         <div style="background: white; padding: 20px; border-radius: 8px; border-left: 4px solid #667eea; margin: 20px 0;">
             <h3 style="color: #667eea; margin-top: 0;">Account Details:</h3>
@@ -452,7 +452,7 @@ This is an automated message. Please do not reply to this email.
     </div>
 
     <div style="text-align: center; margin-top: 30px; padding: 20px; color: #666; font-size: 14px;">
-        <p style="margin: 0;">Best regards,<br>Marshalats Academy Team</p>
+        <p style="margin: 0;">Best regards,<br>Rock Martial Arts Academy Team</p>
         <p style="margin: 10px 0 0 0;">This is an automated message. Please do not reply to this email.</p>
     </div>
 </body>

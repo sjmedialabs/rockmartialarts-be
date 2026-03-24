@@ -142,17 +142,17 @@ class EmailService:
 
         # Customize subject and branding based on user type
         if user_type == "superadmin":
-            subject = "🔐 Superadmin Password Reset Request - Marshalats Academy"
+            subject = "🔐 Superadmin Password Reset Request - Rock Martial Arts Academy"
             role_title = "Superadmin"
             theme_color = "#dc2626"  # Red
             emoji = "🔐"
         elif user_type == "coach":
-            subject = "🥋 Coach Password Reset Request - Marshalats Academy"
+            subject = "🥋 Coach Password Reset Request - Rock Martial Arts Academy"
             role_title = "Coach"
             theme_color = "#ea580c"  # Orange
             emoji = "🥋"
         else:  # student (default)
-            subject = "Password Reset Request - Marshalats Academy"
+            subject = "Password Reset Request - Rock Martial Arts Academy"
             role_title = "Student"
             theme_color = "#2563eb"  # Blue
             emoji = "🥋"
@@ -161,7 +161,7 @@ class EmailService:
         text_body = f"""
 Hello {user_name},
 
-You have requested to reset your {role_title.lower()} password for your Marshalats Academy account.
+You have requested to reset your {role_title.lower()} password for your Rock Martial Arts Academy account.
 
 Please click on the following link to reset your password:
 {reset_link}
@@ -171,7 +171,7 @@ This link will expire in 15 minutes for security reasons.
 If you did not request this password reset, please ignore this email and your password will remain unchanged.
 
 Best regards,
-Marshalats Academy Team
+Rock Martial Arts Academy Team
         """.strip()
         
         # HTML version - role-specific styling and branding
@@ -197,7 +197,7 @@ Marshalats Academy Team
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin: 0; color: {theme_color};">{emoji} Marshalats Academy</h1>
+            <h1 style="margin: 0; color: {theme_color};">{emoji} Rock Martial Arts Academy</h1>
             <p style="margin: 5px 0 0 0; color: #666;">{role_title} Portal</p>
         </div>
 
@@ -205,7 +205,7 @@ Marshalats Academy Team
             <h2 class="role-header">{role_title} Password Reset Request</h2>
             <p>Hello <strong>{user_name}</strong>,</p>
 
-            <p>You have requested to reset your <strong>{role_title.lower()} password</strong> for your Marshalats Academy account.</p>
+            <p>You have requested to reset your <strong>{role_title.lower()} password</strong> for your Rock Martial Arts Academy account.</p>
 
             <p>Please click the button below to reset your password:</p>
 
@@ -254,17 +254,17 @@ Marshalats Academy Team
 
         # Customize subject and branding based on user type
         if user_type == "superadmin":
-            subject = "🔐 Superadmin Password Reset Request - Marshalats Academy"
+            subject = "🔐 Superadmin Password Reset Request - Rock Martial Arts Academy"
             role_title = "Superadmin"
             theme_color = "#dc2626"  # Red
             emoji = "🔐"
         elif user_type == "coach":
-            subject = "🥋 Coach Password Reset Request - Marshalats Academy"
+            subject = "🥋 Coach Password Reset Request - Rock Martial Arts Academy"
             role_title = "Coach"
             theme_color = "#ea580c"  # Orange
             emoji = "🥋"
         else:  # student (default)
-            subject = "Password Reset Request - Marshalats Academy"
+            subject = "Password Reset Request - Rock Martial Arts Academy"
             role_title = "Student"
             theme_color = "#2563eb"  # Blue
             emoji = "🥋"
@@ -273,7 +273,7 @@ Marshalats Academy Team
         text_body = f"""
 Hello {user_name},
 
-You have requested to reset your {role_title.lower()} password for your Marshalats Academy account.
+You have requested to reset your {role_title.lower()} password for your Rock Martial Arts Academy account.
 
 Please click on the following link to reset your password:
 {reset_link}
@@ -283,7 +283,7 @@ This link will expire in 15 minutes for security reasons.
 If you did not request this password reset, please ignore this email and your password will remain unchanged.
 
 Best regards,
-Marshalats Academy Team
+Rock Martial Arts Academy Team
         """.strip()
 
         # HTML version - role-specific styling and branding (same as SMTP version)
@@ -309,7 +309,7 @@ Marshalats Academy Team
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin: 0; color: {theme_color};">{emoji} Marshalats Academy</h1>
+            <h1 style="margin: 0; color: {theme_color};">{emoji} Rock Martial Arts Academy</h1>
             <p style="margin: 5px 0 0 0; color: #666;">{role_title} Portal</p>
         </div>
 
@@ -317,7 +317,7 @@ Marshalats Academy Team
             <h2 class="role-header">{role_title} Password Reset Request</h2>
             <p>Hello <strong>{user_name}</strong>,</p>
 
-            <p>You have requested to reset your <strong>{role_title.lower()} password</strong> for your Marshalats Academy account.</p>
+            <p>You have requested to reset your <strong>{role_title.lower()} password</strong> for your Rock Martial Arts Academy account.</p>
 
             <p>Please click the button below to reset your password:</p>
 
@@ -338,7 +338,7 @@ Marshalats Academy Team
         </div>
 
         <div class="footer">
-            <p style="margin: 0;">© 2025 Marshalats Academy. All rights reserved.</p>
+            <p style="margin: 0;">© 2025 Rock Martial Arts Academy. All rights reserved.</p>
             <p style="margin: 5px 0 0 0;">This is an automated message, please do not reply.</p>
         </div>
     </div>
