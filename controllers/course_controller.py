@@ -8,6 +8,79 @@ from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
 
+
+def _timing_field(t: Dict[str, Any], *keys: str) -> str:
+    if not isinstance(t, dict):
+        return ""
+    for k in keys:
+        v = t.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def format_branch_timings_display(timings_list: Any) -> str:
+    """Build a single display string from branch operational_details.timings (flexible field names)."""
+    if not timings_list or not isinstance(timings_list, (list, tuple)):
+        return "—"
+    parts: list[str] = []
+    for t in timings_list[:24]:
+        if not isinstance(t, dict):
+            continue
+        open_t = _timing_field(t, "open", "open_time", "start", "from")
+        close_t = _timing_field(t, "close", "close_time", "end", "to")
+        day = _timing_field(t, "day", "weekday")
+        if open_t and close_t:
+            parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
+        elif open_t or close_t:
+            slot = f"{open_t} – {close_t}".strip(" –") if (open_t and close_t) else (open_t or close_t)
+            parts.append(f"{day}: {slot}" if day else slot)
+    if parts:
+        return " | ".join(parts)
+    first = timings_list[0] if timings_list else None
+    if isinstance(first, dict):
+        open_t = _timing_field(first, "open", "open_time", "start", "from")
+        close_t = _timing_field(first, "close", "close_time", "end", "to")
+        if open_t and close_t:
+            return f"{open_t} to {close_t}"
+        if open_t or close_t:
+            return open_t or close_t
+    return "—"
+
+
+def _format_course_batches_timings(course_id: str, schedule: Any) -> str:
+    """Build display string from assignments.course_schedule for one course."""
+    if not schedule or not isinstance(schedule, list):
+        return ""
+    entry = None
+    for e in schedule:
+        if isinstance(e, dict) and str(e.get("course_id", "")).strip() == str(course_id).strip():
+            entry = e
+            break
+    if not entry:
+        return ""
+    batches = entry.get("batches") or []
+    parts: list[str] = []
+    for b in batches:
+        if not isinstance(b, dict):
+            continue
+        days = b.get("days") or []
+        ds = ", ".join(str(d) for d in days if d) if days else ""
+        st = str(b.get("start_time") or "").strip()
+        en = str(b.get("end_time") or "").strip()
+        ts = f"{st} – {en}" if st and en else (st or en)
+        if ds and ts:
+            parts.append(f"{ds} · {ts}")
+        elif ds:
+            parts.append(ds)
+        elif ts:
+            parts.append(ts)
+    return " | ".join(parts) if parts else ""
+
+
 class CourseController:
     @staticmethod
     def _attach_public_about_fields(course_dict: Dict[str, Any]) -> None:
@@ -631,16 +704,12 @@ class CourseController:
 
         branch_name = (branch.get("branch") or {}).get("name") or branch.get("name") or "Branch"
         timings_list = (branch.get("operational_details") or {}).get("timings") or []
-        timings_display = "—"
-        if timings_list:
-            parts = []
-            for t in timings_list[:3]:
-                open_t = t.get("open", "")
-                close_t = t.get("close", "")
-                day = t.get("day", "")
-                if open_t and close_t:
-                    parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
-            timings_display = " | ".join(parts) if parts else (f"{timings_list[0].get('open', '')} to {timings_list[0].get('close', '')}" if timings_list else "—")
+        timings_display = format_branch_timings_display(timings_list)
+        batch_timings = _format_course_batches_timings(
+            course_id, (branch.get("assignments") or {}).get("course_schedule")
+        )
+        if batch_timings:
+            timings_display = batch_timings
 
         durations = await db.durations.find({"is_active": True}).sort("display_order", 1).limit(20).to_list(length=20)
         duration_display = "—"

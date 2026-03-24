@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, AliasChoices, ConfigDict
 from datetime import datetime, date
 from typing import Optional, Dict, List
 import uuid
@@ -28,10 +28,43 @@ class OperationalDetails(BaseModel):
     timings: List[OperationalTiming]
     holidays: List[str]  # List of date strings in YYYY-MM-DD format
 
+
+class AssignmentBatch(BaseModel):
+    """Per-batch schedule when a course is offered at a branch (optional; persisted with branch)."""
+    model_config = ConfigDict(extra="ignore")
+
+    start_time: str = Field(
+        default="",
+        validation_alias=AliasChoices("start_time", "startTime"),
+    )
+    end_time: str = Field(
+        default="",
+        validation_alias=AliasChoices("end_time", "endTime"),
+    )
+    coach_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("coach_id", "coachId"),
+    )
+    days: List[str] = Field(default_factory=list)
+
+
+class CourseAssignmentDetail(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    course_id: str = Field(validation_alias=AliasChoices("course_id", "courseId"))
+    batches: List[AssignmentBatch] = Field(default_factory=list)
+
+
 class Assignments(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     accessories_available: bool
     courses: List[str]  # List of course IDs (UUIDs)
     branch_admins: List[str]  # List of user IDs (UUIDs) for coaches
+    course_schedule: Optional[List[CourseAssignmentDetail]] = Field(
+        default=None,
+        validation_alias=AliasChoices("course_schedule", "courseSchedule"),
+    )
 
 class BankDetails(BaseModel):
     bank_name: str

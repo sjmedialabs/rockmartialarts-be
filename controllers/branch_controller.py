@@ -10,6 +10,13 @@ from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
 
+def _pydantic_dump(model) -> dict:
+    """BranchUpdate payload as plain dicts for MongoDB (Pydantic v1/v2)."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=True, mode="python")
+    return model.dict(exclude_unset=True)
+
+
 class BranchController:
     @staticmethod
     async def create_branch(
@@ -200,6 +207,7 @@ class BranchController:
                 "assignments": {
                     "accessories_available": assignments.get("accessories_available", False),
                     "courses": assignments.get("courses", []),
+                    "course_schedule": assignments.get("course_schedule") or [],
                 },
             }
             formatted_branches.append(formatted_branch)
@@ -531,15 +539,29 @@ class BranchController:
                 raise HTTPException(status_code=403, detail="You can only update branches where you are listed as an admin.")
             
             # Restrict fields a Coach Admin can update
-            update_dict = branch_update.dict(exclude_unset=True)
+            update_dict = _pydantic_dump(branch_update)
             restricted_fields = ["manager_id", "is_active", "assignments", "bank_details"]
             for field in restricted_fields:
                 if field in update_dict:
                     raise HTTPException(status_code=403, detail=f"Coach Admins cannot update the '{field}' field.")
 
-        update_data = {k: v for k, v in branch_update.dict(exclude_unset=True).items()}
+        update_data = {k: v for k, v in _pydantic_dump(branch_update).items()}
         if not update_data:
             raise HTTPException(status_code=400, detail="No update data provided")
+
+        # $set replaces the whole `assignments` document. If the client omits
+        # `course_schedule`, model_dump(exclude_unset=True) drops the key and Mongo
+        # would erase saved batch data — carry forward the previous schedule.
+        if "assignments" in update_data and isinstance(update_data["assignments"], dict):
+            new_asg = update_data["assignments"]
+            if "course_schedule" not in new_asg:
+                prev_doc = await db.branches.find_one(
+                    {"id": branch_id},
+                    {"assignments.course_schedule": 1, "_id": 0},
+                )
+                prev_cs = (prev_doc or {}).get("assignments", {}).get("course_schedule")
+                if prev_cs is not None:
+                    new_asg["course_schedule"] = prev_cs
 
         update_data["updated_at"] = datetime.utcnow()
         
