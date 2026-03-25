@@ -55,7 +55,11 @@ load_dotenv(ROOT_DIR / '.env')
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+    mongo_url = (
+        os.getenv("MONGO_URL")
+        or os.getenv("MONGO_URI")
+        or "mongodb://localhost:27017"
+    )
     app.mongodb_client = AsyncIOMotorClient(mongo_url, tlsInsecure=True)
     db_name = os.getenv("DB_NAME", "marshalats")
     app.mongodb = app.mongodb_client.get_database(db_name)

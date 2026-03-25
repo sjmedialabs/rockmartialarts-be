@@ -1,4 +1,4 @@
-#!/Users/alviongs/Documents/Projects/rockmartialarts/rockmartialarts-be/venv/bin/python3.14
+#!/var/www/rockmartialarts-be/venv/bin/python3
 
 import sys
 import json
