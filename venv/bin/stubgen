@@ -1,4 +1,4 @@
-#!/Users/alviongs/Documents/Projects/rockmartialarts/rockmartialarts-be/venv/bin/python3.12
+#!/var/www/rockmartialarts-be/venv/bin/python3.12
 import sys
 from mypy.stubgen import main
 if __name__ == '__main__':
