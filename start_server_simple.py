@@ -7,8 +7,8 @@ from server import app
 
 if __name__ == "__main__":
     print("🚀 Starting Marshalats Backend Server...")
-    print("📍 Server will be available at: http://31.97.224.169:8003")
-    print("📖 API Documentation: http://31.97.224.169:8003/docs")
+    print("📍 Server will be available at: https://rockmartialartsacademy.com")
+    print("📖 API Documentation: https://rockmartialartsacademy.com/docs")
     print("=" * 50)
     
     try:

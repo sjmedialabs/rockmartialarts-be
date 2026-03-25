@@ -1,12 +1,15 @@
 from fastapi import HTTPException, Depends
 from typing import Optional, Dict, Any
 from datetime import datetime
+import logging
 
 from models.course_models import CourseCreate, CourseUpdate, Course
 from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
+
+logger = logging.getLogger(__name__)
 
 
 def _timing_field(t: Dict[str, Any], *keys: str) -> str:
@@ -582,6 +585,14 @@ class CourseController:
 
         # Get total count
         total = await db.courses.count_documents(query)
+
+        logger.info(
+            "public courses list: page_size=%s total_in_db=%s active_only=%s skip=%s",
+            len(enhanced_courses),
+            total,
+            active_only,
+            skip,
+        )
 
         return {
             "message": f"Retrieved {len(enhanced_courses)} courses successfully",

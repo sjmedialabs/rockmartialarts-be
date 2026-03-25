@@ -88,8 +88,8 @@ else:
 allowed_origins_list = [
     "http://localhost:3022",
     "http://127.0.0.1:3022",
-    "http://31.97.224.169:3022",
-    "https://31.97.224.169:3022",
+    "https://rockmartialartsacademy.com",
+    "http://rockmartialartsacademy.com",
     "*"  # Allow all origins as fallback
 ]
 

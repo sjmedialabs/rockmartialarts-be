@@ -5,7 +5,7 @@ The Marshalats Learning Management System provides multiple authentication syste
 
 ## Base URL
 ```
-Development: http://31.97.224.169:8003/api
+Development: https://rockmartialartsacademy.com/api
 Production: https://edumanage-44.preview.dev.com/api
 ```
 

@@ -14,6 +14,9 @@ from utils.helpers import serialize_doc, log_activity, send_sms
 from utils.email_service import send_password_reset_email, send_password_reset_email_webhook
 from utils.enrollment_dates import resolve_enrollment_end_date
 
+logger = logging.getLogger(__name__)
+
+
 class AuthController:
     @staticmethod
     async def register_user(user_data: UserCreate, request: Request):
@@ -244,6 +247,8 @@ class AuthController:
             db = get_db()
             if db is None:
                 raise HTTPException(status_code=503, detail="Database not initialized")
+
+            logger.info("POST /api/auth/login: attempt")
             
             user = await db.users.find_one({"email": user_credentials.email})
             # Support both "password" and "password_hash" for stored hash
@@ -260,9 +265,11 @@ class AuthController:
                     )
                 except Exception:
                     pass
+                logger.warning("POST /api/auth/login: rejected (invalid credentials)")
                 raise HTTPException(status_code=401, detail="Incorrect email or password")
             
-            if not user.get("is_active", False):
+            # Missing is_active: treat as active (legacy documents); explicit False blocks login
+            if user.get("is_active") is False:
                 try:
                     await log_activity(
                         request=request,
@@ -274,6 +281,7 @@ class AuthController:
                     )
                 except Exception:
                     pass
+                logger.warning("POST /api/auth/login: rejected (inactive user id=%s)", user.get("id"))
                 raise HTTPException(status_code=400, detail="Account is deactivated")
             
             access_token = create_access_token(data={"sub": user["id"], "role": user.get("role", "student")})
@@ -294,6 +302,7 @@ class AuthController:
             if not branch_id and user.get("branch"):
                 branch_id = user["branch"].get("branch_id")
 
+            logger.info("POST /api/auth/login: success user_id=%s", user.get("id"))
             return {"access_token": access_token, "token_type": "bearer", "expires_in": 86400, "user": {
                 "id": user["id"],
                 "email": user["email"],

@@ -17,8 +17,8 @@ def main():
         from server import app
         
         print("✅ Modules imported successfully")
-        print("🌐 Starting server on http://31.97.224.169:8003")
-        print("📖 API docs will be at http://31.97.224.169:8003/docs")
+        print("🌐 Starting server on https://rockmartialartsacademy.com")
+        print("📖 API docs will be at https://rockmartialartsacademy.com/docs")
         print("🛑 Press Ctrl+C to stop")
         print("-" * 40)
         
