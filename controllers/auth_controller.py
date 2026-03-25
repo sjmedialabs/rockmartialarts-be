@@ -5,6 +5,7 @@ import secrets
 import jwt
 import os
 import logging
+import re
 import uuid
 
 from models.user_models import UserCreate, UserLogin, ForgotPassword, ResetPassword, UserUpdate, BaseUser, UserRole, StudentProfileUpdate, StudentProfileResponse, StudentAddress, StudentEmergencyContact, StudentMedicalInfo
@@ -471,6 +472,43 @@ class AuthController:
                 "name": "User",
                 "email": email
             }
+
+    @staticmethod
+    async def check_phone_exists(phone: str):
+        """Public registration: true if any LMS user already uses this mobile (last 10 digits)."""
+        db = get_db()
+        raw = (phone or "").strip()
+        digits = "".join(c for c in raw if c.isdigit())
+        if len(digits) < 10:
+            return {"exists": False}
+        norm = digits[-10:]
+        variants = [
+            norm,
+            f"91{norm}",
+            f"+91{norm}",
+            f"+91-{norm}",
+            f"0{norm}",
+            f"91-{norm}",
+            f"+91 {norm}",
+        ]
+        try:
+            u = await db.users.find_one({"phone": {"$in": variants}})
+            if u:
+                return {"exists": True}
+            u = await db.users.find_one({"phone": {"$regex": re.escape(norm) + r"\s*$"}})
+            if u:
+                return {"exists": True}
+            async for doc in db.users.find(
+                {"phone": {"$exists": True, "$nin": [None, ""]}},
+                {"phone": 1},
+            ).limit(5000):
+                stored = "".join(c for c in str(doc.get("phone", "")) if c.isdigit())
+                if len(stored) >= 10 and stored[-10:] == norm:
+                    return {"exists": True}
+            return {"exists": False}
+        except Exception as e:
+            logger.error("Error checking phone existence: %s", e)
+            return {"exists": False}
 
     @staticmethod
     async def get_student_profile(current_user: dict):

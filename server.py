@@ -10,6 +10,7 @@ import logging
 from contextlib import asynccontextmanager
 
 # Import routes
+from routes.reg_checkout_routes import router as reg_checkout_router
 from routes import (
     auth_router,
     user_router,
@@ -134,6 +135,7 @@ app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
 app.include_router(onboarding_router, prefix="/api/onboarding", tags=["Onboarding"])
+app.include_router(reg_checkout_router, prefix="/api/reg-checkout", tags=["Registration Checkout"])
 
 @app.get("/")
 async def root():
@@ -155,9 +157,15 @@ async def test_coach_auth():
 
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
-    """Convert bcrypt 72-byte ValueError to 401 so login never returns 500."""
+    """Map bcrypt password-length errors to 401 only on auth login (not OTP/reg-checkout)."""
     msg = str(exc)
-    if "72 bytes" in msg and "password" in msg.lower():
+    path = request.url.path or ""
+    is_login = "/auth/login" in path or path.endswith("/login")
+    if (
+        is_login
+        and "72 bytes" in msg
+        and "password" in msg.lower()
+    ):
         return JSONResponse(
             status_code=401,
             content={"detail": "Invalid email or password", "message": "Invalid email or password"},

@@ -10,10 +10,20 @@ router = APIRouter()
 class CheckUserRequest(BaseModel):
     email: EmailStr
 
+
+class CheckPhoneRequest(BaseModel):
+    phone: str
+
 @router.post("/check-user")
 async def check_user(check_user_data: CheckUserRequest):
     """Check if a user exists with the given email address"""
     return await AuthController.check_user_exists(check_user_data.email)
+
+
+@router.post("/check-phone")
+async def check_phone(body: CheckPhoneRequest):
+    """Check if a user exists with this phone (registration / public)."""
+    return await AuthController.check_phone_exists(body.phone)
 
 @router.post("/register")
 async def register_user(user_data: UserCreate, request: Request):

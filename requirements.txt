@@ -25,5 +25,7 @@ jq>=1.6.0
 typer>=0.9.0
 qrcode>=7.4.2
 pillow>=10.0.0
-bcrypt>=4.0.0
+# passlib 1.7.4 is incompatible with bcrypt 5.x (breaks OTP hashing → bogus 401 "Invalid email or password")
+bcrypt>=4.0.0,<5
 httpx>=0.27.0
+razorpay>=1.4.2
