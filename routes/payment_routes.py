@@ -34,10 +34,13 @@ async def process_registration_payment(payment_data: RegistrationPaymentCreate):
 async def get_course_payment_info(
     course_id: str = Query(..., description="Course ID"),
     branch_id: str = Query(..., description="Branch ID"),
-    duration: str = Query(..., description="Duration code")
+    duration: str = Query(..., description="Duration code"),
+    batch_ref: Optional[str] = Query(None, description="Branch batch for per-batch pricing"),
 ):
     """Get payment information for a course (public endpoint)"""
-    return await PaymentController.get_course_payment_info(course_id, branch_id, duration)
+    return await PaymentController.get_course_payment_info(
+        course_id, branch_id, duration, batch_ref=batch_ref
+    )
 
 @router.get("/notifications")
 async def get_payment_notifications(

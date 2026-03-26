@@ -12,6 +12,54 @@ from utils.helpers import serialize_doc
 logger = logging.getLogger(__name__)
 
 
+def _public_branch_batches_for_course(branch: dict, course_id: str) -> list:
+    """Batches from branch course_schedule for registration (batch_ref matches payment-info)."""
+    sched = (branch.get("assignments") or {}).get("course_schedule") or []
+    for entry in sched:
+        cid = str(entry.get("course_id") or entry.get("courseId") or "")
+        if cid != str(course_id):
+            continue
+        batches = list(entry.get("batches") or [])
+        out = []
+        for i, b in enumerate(batches):
+            bid = str((b.get("batch_id") or b.get("id") or "")).strip()
+            ref = bid if bid else f"__index:{i}__"
+            days = b.get("days") or []
+            st = str((b.get("start_time") or "")).strip()
+            et = str((b.get("end_time") or "")).strip()
+            label_parts = []
+            if days:
+                label_parts.append(", ".join(str(d) for d in days))
+            if st or et:
+                label_parts.append(f"{st or '—'} – {et or '—'}")
+            label = " · ".join(label_parts) if label_parts else f"Batch {i + 1}"
+            raw_fee = b.get("batch_fee")
+            if raw_fee is None:
+                raw_fee = b.get("fee")
+            if raw_fee is None:
+                raw_fee = b.get("price")
+            fee = None
+            if raw_fee is not None:
+                try:
+                    fee = float(raw_fee)
+                except (TypeError, ValueError):
+                    fee = None
+            bname = str((b.get("batch_name") or b.get("name") or "")).strip()
+            out.append(
+                {
+                    "batch_ref": ref,
+                    "name": bname or None,
+                    "label": label,
+                    "batch_fee": fee,
+                    "days": days,
+                    "start_time": st,
+                    "end_time": et,
+                }
+            )
+        return out
+    return []
+
+
 def _timing_field(t: Dict[str, Any], *keys: str) -> str:
     if not isinstance(t, dict):
         return ""
@@ -820,6 +868,7 @@ class CourseController:
                 "media_resources": serialized.get("media_resources") or {},
                 "pricing": fees,
                 "available_durations": available_durations,
+                "branch_batches": _public_branch_batches_for_course(branch, serialized.get("id")),
             })
         return {"courses": result_courses, "branch_timings": branch_timings}
 

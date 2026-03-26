@@ -46,6 +46,21 @@ class AssignmentBatch(BaseModel):
         validation_alias=AliasChoices("coach_id", "coachId"),
     )
     days: List[str] = Field(default_factory=list)
+    batch_name: str = Field(
+        default="",
+        validation_alias=AliasChoices("batch_name", "name"),
+        description="Optional display name in admin / registration (e.g. Morning batch).",
+    )
+    batch_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("batch_id", "id"),
+        description="Stable id for registration / pricing (persisted).",
+    )
+    batch_fee: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("batch_fee", "fee", "price"),
+        description="Per-batch course fee at this branch (overrides tenure-based fee when set).",
+    )
 
 
 class CourseAssignmentDetail(BaseModel):

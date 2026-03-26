@@ -77,6 +77,8 @@ class RegistrationPaymentCreate(BaseModel):
     card_details: Optional[Dict[str, str]] = None  # For card payments
     # From website tenure selector — used when DB duration doc is missing or incomplete
     duration_months: Optional[int] = None
+    # Matches course payment-info batch_ref (per-batch fee at branch)
+    batch_ref: Optional[str] = None
 
 class RegistrationPaymentResponse(BaseModel):
     payment_id: str

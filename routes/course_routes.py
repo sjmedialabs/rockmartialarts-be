@@ -70,10 +70,16 @@ async def get_courses_by_branch(
 async def get_course_payment_info(
     course_id: str,
     branch_id: str = Query(..., description="Branch ID"),
-    duration: str = Query(..., description="Duration code")
+    duration: str = Query(..., description="Duration code"),
+    batch_ref: Optional[str] = Query(
+        None,
+        description="Branch batch id or __index:n__ from public by-branch course list",
+    ),
 ):
     """Get payment information for a course (public endpoint for registration)"""
-    return await PaymentController.get_course_payment_info(course_id, branch_id, duration)
+    return await PaymentController.get_course_payment_info(
+        course_id, branch_id, duration, batch_ref=batch_ref
+    )
 
 @router.get("/public/all")
 async def get_public_courses(

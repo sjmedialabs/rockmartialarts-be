@@ -30,6 +30,55 @@ def _duration_price_keys(duration: str, duration_info: Optional[dict]) -> list:
     return keys
 
 
+def _batches_for_course_on_branch(branch: dict, course_id: str) -> list:
+    sched = (branch.get("assignments") or {}).get("course_schedule") or []
+    for entry in sched:
+        cid = str(entry.get("course_id") or entry.get("courseId") or "")
+        if cid == str(course_id):
+            return list(entry.get("batches") or [])
+    return []
+
+
+def _resolve_branch_batch(batches: list, batch_ref: Optional[str]):
+    """Match persisted batch_id/id or synthetic __index:n__ from public API."""
+    if not batch_ref or not str(batch_ref).strip():
+        return None
+    s = str(batch_ref).strip()
+    if s.startswith("__index:") and s.endswith("__"):
+        inner = s[8:-2]
+        try:
+            idx = int(inner)
+            if 0 <= idx < len(batches):
+                return batches[idx]
+        except ValueError:
+            return None
+        return None
+    for b in batches:
+        bid = str((b.get("batch_id") or b.get("id") or "")).strip()
+        if bid == s:
+            return b
+    return None
+
+
+def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
+    if not batch_doc:
+        return None
+    raw = batch_doc.get("batch_fee")
+    if raw is None:
+        raw = batch_doc.get("fee")
+    if raw is None:
+        raw = batch_doc.get("price")
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v < 0:
+        return None
+    return v
+
+
 class PaymentController:
     @staticmethod
     async def student_process_payment(
@@ -145,7 +194,12 @@ class PaymentController:
         return {"message": "Payment recorded successfully", "payment_id": payment_doc["id"]}
 
     @staticmethod
-    async def get_course_payment_info(course_id: str, branch_id: str, duration: str):
+    async def get_course_payment_info(
+        course_id: str,
+        branch_id: str,
+        duration: str,
+        batch_ref: Optional[str] = None,
+    ):
         """Get payment information for a course"""
         try:
             db = get_db()
@@ -189,10 +243,24 @@ class PaymentController:
 
             dur_keys = _duration_price_keys(duration, duration_info)
 
+            batches = _batches_for_course_on_branch(branch, course_id)
+            if batch_ref and str(batch_ref).strip():
+                bdoc = _resolve_branch_batch(batches, batch_ref)
+                if bdoc is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid batch selection for this course at the selected branch.",
+                    )
+                bf = _batch_fee_from_doc(bdoc)
+                if bf is not None:
+                    course_fee = bf
+                    total_amount = course_fee + admission_fee
+                    pricing_multiplier = 1.0
+
             # 1) Branch-specific duration fees (dict may use duration id, code, or slug)
             branch_pricing = course.get("branch_pricing") or {}
             bp_val = None
-            if branch_id in branch_pricing:
+            if total_amount is None and branch_id in branch_pricing:
                 bp_val = branch_pricing[branch_id]
                 if isinstance(bp_val, dict):
                     picked = None
@@ -281,7 +349,8 @@ class PaymentController:
             payment_info = await PaymentController.get_course_payment_info(
                 payment_data.course_id,
                 payment_data.branch_id,
-                payment_data.duration
+                payment_data.duration,
+                batch_ref=payment_data.batch_ref,
             )
 
             # Generate transaction ID

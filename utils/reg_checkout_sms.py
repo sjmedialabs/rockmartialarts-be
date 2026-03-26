@@ -17,13 +17,42 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import requests
+
+# (success, optional short reason for API clients — never include secrets)
+SmsSendResult = Tuple[bool, Optional[str]]
+
+
+def _sms_fail_reason(msg: str) -> str:
+    s = (msg or "").strip().replace("\n", " ")
+    if len(s) > 240:
+        return s[:237] + "..."
+    return s
+
+
+def public_sms_failure_hint(reason: Optional[str]) -> Optional[str]:
+    """Avoid echoing query strings or keys to the browser."""
+    if not reason:
+        return None
+    low = reason.lower()
+    if any(x in low for x in ("apikey", "api_key", "password=", "username=")):
+        return "SMS gateway returned an error (see server logs for details)."
+    return _sms_fail_reason(reason)
 
 logger = logging.getLogger(__name__)
 
 MSG91_DEFAULT_URL = "https://api.msg91.com/api/sendhttp.php"
 SMSLOGIN_DEFAULT_URL = "https://smslogin.co/v3/api.php"
+
+# Outbound SMS: disable proxy for this call only (avoids dead HTTP_PROXY on servers).
+# Note: do not pass trust_env= — older `requests` builds raise
+# "Session.request() got an unexpected keyword argument 'trust_env'".
+def _sms_request_kwargs(timeout: int) -> dict:
+    return {
+        "timeout": timeout,
+        "proxies": {"http": None, "https": None},
+    }
 
 
 def _smslogin_username() -> str:
@@ -73,12 +102,12 @@ def format_sms_mobile(phone: str) -> str:
     return d or phone.strip()
 
 
-def _send_msg91(phone: str, message: str, template_id: Optional[str]) -> bool:
+def _send_msg91(phone: str, message: str, template_id: Optional[str]) -> SmsSendResult:
     authkey = (os.getenv("SMS_API_KEY") or "").strip()
     sender = (os.getenv("SMS_SENDER_ID") or "").strip()
     if not authkey or not sender:
         logger.error("MSG91 requires SMS_API_KEY and SMS_SENDER_ID")
-        return False
+        return False, "MSG91 requires SMS_API_KEY and SMS_SENDER_ID"
 
     url = (os.getenv("SMS_API_URL") or "").strip() or MSG91_DEFAULT_URL
     mobiles = format_sms_mobile(phone)
@@ -95,43 +124,46 @@ def _send_msg91(phone: str, message: str, template_id: Optional[str]) -> bool:
         params["DLT_TE_ID"] = template_id
 
     try:
-        r = requests.post(url, data=params, timeout=20)
+        r = requests.post(url, data=params, **_sms_request_kwargs(20))
         text = (r.text or "")[:500]
         if r.status_code >= 400:
             logger.error("MSG91 HTTP %s: %s", r.status_code, text)
-            return False
+            return False, f"MSG91 HTTP {r.status_code}"
         try:
             data = r.json()
             if isinstance(data, dict):
                 t = str(data.get("type", "")).lower()
                 if t == "success":
                     logger.info("MSG91 sent ok: %s", str(data)[:200])
-                    return True
+                    return True, None
                 if data.get("message") and t == "error":
                     logger.error("MSG91 error: %s", data)
-                    return False
+                    return False, str(data.get("message") or "MSG91 error")[:200]
         except ValueError:
             pass
         low = text.lower()
         if "invalid" in low and "success" not in low:
             logger.error("MSG91 response: %s", text)
-            return False
+            return False, text[:200]
         logger.info("MSG91 response: %s", text[:200])
-        return True
+        return True, None
     except requests.RequestException as e:
         logger.exception("MSG91 request failed: %s", e)
-        return False
+        return False, str(e)[:200]
 
 
-def _send_smslogin(phone: str, message: str, template_id: Optional[str]) -> bool:
+def _send_smslogin(phone: str, message: str, template_id: Optional[str]) -> SmsSendResult:
     """Rock Academy / smslogin.co v3 API — GET with query parameters."""
     base = (os.getenv("SMS_API_URL") or "").strip() or SMSLOGIN_DEFAULT_URL
+    # If .env pasted a full example URL with ?username=…, strip the query; params are set below.
+    if "?" in base:
+        base = base.split("?", 1)[0].strip() or SMSLOGIN_DEFAULT_URL
     username = _smslogin_username()
     apikey = (os.getenv("SMS_API_KEY") or "").strip()
     sender = (os.getenv("SMS_SENDER_ID") or "").strip()
     if not username or not apikey or not sender:
         logger.error("smslogin requires SMS_USERNAME, SMS_API_KEY, SMS_SENDER_ID")
-        return False
+        return False, "Missing SMS_USERNAME, SMS_API_KEY, or SMS_SENDER_ID"
 
     params: Dict[str, Any] = {
         "username": username,
@@ -144,43 +176,92 @@ def _send_smslogin(phone: str, message: str, template_id: Optional[str]) -> bool
         params["templateid"] = template_id
 
     try:
-        r = requests.get(base, params=params, timeout=25)
+        r = requests.get(base, params=params, **_sms_request_kwargs(25))
         text = (r.text or "").strip()
         snippet = text[:800]
         if r.status_code >= 400:
             logger.error("smslogin HTTP %s: %s", r.status_code, snippet)
-            return False
+            return False, f"HTTP {r.status_code} from SMS gateway"
+
+        # JSON body (many gateways)
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                st = str(
+                    data.get("status")
+                    or data.get("Status")
+                    or data.get("response")
+                    or data.get("code")
+                    or ""
+                ).lower()
+                if st in ("success", "ok", "1", "true", "200", "sent"):
+                    logger.info("smslogin ok (json): %s", str(data)[:300])
+                    return True, None
+                if data.get("message_id") or data.get("msgid") or data.get("MsgID"):
+                    logger.info("smslogin ok (id): %s", str(data)[:300])
+                    return True, None
+                err = (
+                    data.get("error")
+                    or data.get("message")
+                    or data.get("msg")
+                    or data.get("description")
+                )
+                if err:
+                    logger.error("smslogin json error: %s", data)
+                    return False, str(err)[:200]
+        except ValueError:
+            pass
+
         low = snippet.lower()
+        ok_markers = (
+            "success",
+            "submitted",
+            "accepted",
+            "sent",
+            "message_id",
+            "msgid",
+            "request successfully",
+            "sms sent",
+            "delivered",
+        )
+        if any(m in low for m in ok_markers):
+            logger.info("smslogin ok: %s", snippet)
+            return True, None
+
         err_markers = (
-            "invalid",
             "authentication",
             "auth fail",
             "insufficient",
-            "balance",
-            "error",
+            "invalid user",
+            "invalid api",
+            "invalid mobile",
+            "invalid sender",
+            "recharge",
+            "low balance",
             "failed",
             "reject",
             "unauthor",
+            "dlt",
+            "template",
         )
-        # Short API status lines; avoid flagging normal English in long echoes
-        if len(text) < 500 and any(m in low for m in err_markers):
-            # Some gateways return "success" alongside other words — prefer positive signals
-            if "success" in low or "submitted" in low or "accepted" in low:
-                logger.info("smslogin ok: %s", snippet)
-                return True
+        if len(text) < 800 and any(m in low for m in err_markers):
             logger.error("smslogin error response: %s", snippet)
-            return False
-        logger.info("smslogin response: %s", snippet)
-        return True
+            return False, snippet[:220]
+
+        # Long or ambiguous 200 response — treat as success (log for support)
+        if r.status_code == 200:
+            logger.info("smslogin response (assumed ok): %s", snippet)
+            return True, None
+        return False, snippet[:220] or "Unknown SMS gateway response"
     except requests.RequestException as e:
         logger.exception("smslogin request failed: %s", e)
-        return False
+        return False, str(e)[:200]
 
 
-def _send_form(phone: str, message: str, template_id: Optional[str]) -> bool:
+def _send_form(phone: str, message: str, template_id: Optional[str]) -> SmsSendResult:
     url = (os.getenv("SMS_API_URL") or "").strip()
     if not url:
-        return True
+        return True, None
 
     api_key = (os.getenv("SMS_API_KEY") or "").strip()
     sender = (os.getenv("SMS_SENDER_ID") or "").strip()
@@ -212,17 +293,17 @@ def _send_form(phone: str, message: str, template_id: Optional[str]) -> bool:
             headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        r = requests.post(url, data=data, headers=headers, timeout=20)
+        r = requests.post(url, data=data, headers=headers, **_sms_request_kwargs(20))
         if r.status_code >= 400:
             logger.error("SMS form API error %s: %s", r.status_code, r.text[:500])
-            return False
-        return True
+            return False, f"HTTP {r.status_code}"
+        return True, None
     except requests.RequestException as e:
         logger.exception("SMS form request failed: %s", e)
-        return False
+        return False, str(e)[:200]
 
 
-def _send_json(phone: str, message: str, template_id: Optional[str]) -> bool:
+def _send_json(phone: str, message: str, template_id: Optional[str]) -> SmsSendResult:
     url = (os.getenv("SMS_API_URL") or "").strip()
     api_key = (os.getenv("SMS_API_KEY") or "").strip()
     sender = (os.getenv("SMS_SENDER_ID") or "").strip()
@@ -234,7 +315,7 @@ def _send_json(phone: str, message: str, template_id: Optional[str]) -> bool:
             template_id,
             message[:120],
         )
-        return True
+        return True, None
 
     phone_key = (os.getenv("SMS_JSON_PHONE_FIELD") or "to").strip()
     message_key = (os.getenv("SMS_JSON_MESSAGE_FIELD") or "message").strip()
@@ -272,21 +353,21 @@ def _send_json(phone: str, message: str, template_id: Optional[str]) -> bool:
             headers["api-key"] = api_key
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=20)
+        r = requests.post(url, json=payload, headers=headers, **_sms_request_kwargs(20))
         if r.status_code >= 400:
             logger.error("SMS API error %s: %s", r.status_code, r.text[:500])
-            return False
-        return True
+            return False, f"HTTP {r.status_code}"
+        return True, None
     except requests.RequestException as e:
         logger.exception("SMS request failed: %s", e)
-        return False
+        return False, str(e)[:200]
 
 
 def send_registration_sms(
     phone: str,
     message: str,
     template_id: Optional[str] = None,
-) -> bool:
+) -> SmsSendResult:
     prov = (os.getenv("SMS_PROVIDER") or "json").strip().lower()
     if prov == "msg91":
         return _send_msg91(phone, message, template_id)

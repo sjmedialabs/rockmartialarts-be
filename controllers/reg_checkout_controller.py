@@ -25,7 +25,11 @@ from passlib.context import CryptContext
 
 from models.reg_checkout_models import CreateRegOrderBody, VerifyOtpBody, VerifyRegPaymentBody
 from utils.database import get_db
-from utils.reg_checkout_sms import send_registration_sms, sms_provider_expects_delivery
+from utils.reg_checkout_sms import (
+    public_sms_failure_hint,
+    send_registration_sms,
+    sms_provider_expects_delivery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,60 @@ def _verify_razorpay_signature(order_id: str, pay_id: str, signature: str) -> bo
     return hmac.compare_digest(expected, signature or "")
 
 
+def _dlt_template_id_primary_legacy(primary_key: str, legacy_key: str) -> Optional[str]:
+    """Use explicit *TEMPLATE_ID env, or legacy var only when it looks like an id (not a message with %)."""
+    v = os.getenv(primary_key, "").strip()
+    if v:
+        return v
+    legacy = os.getenv(legacy_key, "").strip()
+    if not legacy:
+        return None
+    if "%" in legacy or "{" in legacy or len(legacy) > 32:
+        return None
+    compact = legacy.replace("-", "").replace("_", "")
+    if compact.isalnum() and len(compact) >= 6 and not legacy.lower().startswith("your "):
+        return legacy
+    return None
+
+
+def _otp_dlt_template_id() -> Optional[str]:
+    """
+    DLT / smslogin `templateid` must be the provider's template ID (digits/alphanumeric),
+    not the approved message text. Prefer DLT_OTP_TEMPLATE_ID; legacy DLT_TEMPLATE_OTP
+    is used only when it looks like an ID (not a sentence).
+    """
+    v = os.getenv("DLT_OTP_TEMPLATE_ID", "").strip() or os.getenv("SMS_OTP_TEMPLATE_ID", "").strip()
+    if v:
+        return v
+    legacy = os.getenv("DLT_TEMPLATE_OTP", "").strip()
+    if not legacy or "%" in legacy or "{" in legacy or len(legacy) > 32:
+        return None
+    compact = legacy.replace("-", "").replace("_", "")
+    if compact.isalnum() and not legacy.lower().startswith("your "):
+        return legacy
+    return None
+
+
+def _otp_sms_message(otp: str) -> str:
+    """SMS body must match the DLT-approved wording; use DLT_OTP_MESSAGE with %s or {otp}."""
+    body = os.getenv("DLT_OTP_MESSAGE", "").strip()
+    if not body:
+        legacy = os.getenv("DLT_TEMPLATE_OTP", "").strip()
+        if legacy and ("%s" in legacy or "{otp}" in legacy.lower()):
+            body = legacy
+    if body:
+        if "%s" in body:
+            try:
+                return body % otp
+            except Exception:
+                logger.exception("DLT_OTP_MESSAGE / DLT_TEMPLATE_OTP %%s formatting failed")
+        return body.replace("{otp}", otp)
+    return (
+        "ROCK MARTIAL ARTS ACADEMY: Your OTP is "
+        f"{otp}. Use this to complete your registration/login. Do not share this code with anyone."
+    )
+
+
 def _parse_end_date(s: str) -> datetime:
     s = (s or "").strip().replace("Z", "")
     if "T" in s:
@@ -145,12 +203,16 @@ class RegCheckoutController:
             upsert=True,
         )
 
-        msg = (
-            "ROCK MARTIAL ARTS ACADEMY: Your OTP is "
-            f"{otp}. Use this to complete your registration/login. Do not share this code with anyone."
-        )
-        tid = os.getenv("DLT_TEMPLATE_OTP", "").strip() or None
-        ok = send_registration_sms(phone, msg, template_id=tid)
+        msg = _otp_sms_message(otp)
+        tid = _otp_dlt_template_id()
+        if tid is None and sms_provider_expects_delivery():
+            prov = (os.getenv("SMS_PROVIDER") or "json").strip().lower()
+            if prov in ("smslogin", "smslogin_co", "rockacademy", "msg91"):
+                logger.warning(
+                    "OTP SMS: no DLT template id (set DLT_OTP_TEMPLATE_ID). "
+                    "smslogin/MSG91 often require templateid for DLT."
+                )
+        ok, sms_err = send_registration_sms(phone, msg, template_id=tid)
         allow_stub = os.getenv("REG_CHECKOUT_ALLOW_SMS_STUB", "").lower() in (
             "1",
             "true",
@@ -159,13 +221,19 @@ class RegCheckoutController:
         expects_sms = sms_provider_expects_delivery()
         if expects_sms and not allow_stub and not ok:
             await db[COL_OTP].delete_one({"phone": norm})
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Could not send OTP SMS. Verify SMS_USERNAME, SMS_API_KEY, SMS_SENDER_ID, "
-                    "DLT_TEMPLATE_OTP, and check server logs for the smslogin/provider response."
-                ),
+            hint = public_sms_failure_hint(sms_err)
+            base = (
+                "Could not send OTP SMS. Set SMS_PROVIDER=smslogin, SMS_API_URL=https://smslogin.co/v3/api.php, "
+                "SMS_USERNAME, SMS_API_KEY, SMS_SENDER_ID, DLT_OTP_TEMPLATE_ID (DLT template id from portal), "
+                "and DLT_OTP_MESSAGE (approved body with %s for OTP). Check server logs for the gateway response."
             )
+            if hint:
+                base = f"{base} Hint: {hint}"
+            base += (
+                " For local/staging without SMS, set REG_CHECKOUT_ALLOW_SMS_STUB=true (OTP is still stored; "
+                "check server logs for the code)."
+            )
+            raise HTTPException(status_code=503, detail=base)
         if expects_sms and allow_stub and not ok:
             logger.warning(
                 "OTP SMS send failed but REG_CHECKOUT_ALLOW_SMS_STUB=true — continuing without delivery."
@@ -334,15 +402,19 @@ class RegCheckoutController:
             f"ROCK MARTIAL ARTS ACADEMY: Welcome {body.name}! Your registration for "
             f"{body.course_name} – {body.duration} is confirmed. Get ready to train hard and grow stronger every day. See you in class!"
         )
-        tid_w = os.getenv("DLT_TEMPLATE_WELCOME", "").strip() or None
-        if not send_registration_sms(body.phone, welcome, template_id=tid_w):
+        tid_w = _dlt_template_id_primary_legacy(
+            "DLT_WELCOME_TEMPLATE_ID", "DLT_TEMPLATE_WELCOME"
+        )
+        if not send_registration_sms(body.phone, welcome, template_id=tid_w)[0]:
             logger.warning(
                 "Welcome SMS failed for payment_id=%s phone=...%s",
                 body.razorpay_payment_id,
                 _normalize_phone(body.phone)[-4:],
             )
 
-        tid_pay = os.getenv("DLT_TEMPLATE_PAYMENT_CONFIRMED", "").strip() or None
+        tid_pay = _dlt_template_id_primary_legacy(
+            "DLT_PAYMENT_TEMPLATE_ID", "DLT_TEMPLATE_PAYMENT_CONFIRMED"
+        )
         if tid_pay:
             amt = float(body.amount)
             pay_msg = (
@@ -350,7 +422,7 @@ class RegCheckoutController:
                 f"{body.course_name} – {body.duration} was received successfully. "
                 "Thank you — see you in class!"
             )
-            if not send_registration_sms(body.phone, pay_msg, template_id=tid_pay):
+            if not send_registration_sms(body.phone, pay_msg, template_id=tid_pay)[0]:
                 logger.warning(
                     "Payment confirmation SMS failed for payment_id=%s",
                     body.razorpay_payment_id,
@@ -397,8 +469,10 @@ class RegCheckoutController:
                 f"ROCK MARTIAL ARTS ACADEMY: Hi {name}, your plan ends on {validity}. "
                 "Don't break your momentum—renew now and keep progressing. Stay strong!"
             )
-            tid = os.getenv("DLT_TEMPLATE_REMINDER", "").strip() or None
-            ok = send_registration_sms(phone, msg, template_id=tid)
+            tid = _dlt_template_id_primary_legacy(
+                "DLT_REMINDER_TEMPLATE_ID", "DLT_TEMPLATE_REMINDER"
+            )
+            ok, _ = send_registration_sms(phone, msg, template_id=tid)
             if ok:
                 await db[COL_SUBSCRIPTIONS].update_one(
                     {"_id": sub["_id"]},
