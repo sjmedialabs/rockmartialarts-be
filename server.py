@@ -62,6 +62,27 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 
+def _configure_dns_resolver() -> None:
+    """Use public DNS when /etc/resolv.conf is missing (common on minimal VPS images)."""
+    try:
+        import dns.resolver
+
+        class _PublicResolver(dns.resolver.Resolver):
+            def __init__(self, filename="/etc/resolv.conf", configure=True):
+                dns.resolver.BaseResolver.__init__(self)
+                self.nameservers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+
+        dns.resolver.Resolver = _PublicResolver  # type: ignore[misc,assignment]
+        dns.resolver.default_resolver = _PublicResolver()
+    except Exception:
+        pass
+
+
+_mongo_uri = os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or ""
+if "mongodb+srv://" in _mongo_uri:
+    _configure_dns_resolver()
+
+
 async def _payments_reconciliation_loop(mongo_db):
     """
     Lightweight reconciliation loop.

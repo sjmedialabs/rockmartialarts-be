@@ -10,30 +10,15 @@ from models.superadmin_models import SuperAdmin, SuperAdminRegister, SuperAdminL
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.email_service import send_password_reset_email
-from utils.auth import hash_password, verify_password, BCRYPT_MAX_PASSWORD_BYTES
+from utils.auth import hash_password, verify_password, BCRYPT_MAX_PASSWORD_BYTES, create_access_token, SECRET_KEY, ALGORITHM
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / '.env')
 
-# JWT settings — MUST match utils/unified_auth.py and utils/auth.py or all protected routes return 401
-SECRET_KEY = os.getenv("SECRET_KEY", "student_management_secret_key_2025_secure")
-ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
 class SuperAdminController:
-    @staticmethod
-    def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-        """Create JWT access token"""
-        to_encode = data.copy()
-        if expires_delta:
-            expire = datetime.utcnow() + expires_delta
-        else:
-            expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-        to_encode.update({"exp": expire})
-        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-        return encoded_jwt
-
     @staticmethod
     async def register_superadmin(admin_data: SuperAdminRegister):
         """Register a new super admin"""
@@ -109,7 +94,7 @@ class SuperAdminController:
             )
         
         # Create access token
-        access_token = SuperAdminController.create_access_token(
+        access_token = create_access_token(
             data={"sub": admin["id"], "email": admin["email"], "role": "superadmin"}
         )
         
@@ -236,7 +221,7 @@ class SuperAdminController:
             return {"message": "If a superadmin account with that email exists, a password reset link has been sent."}
 
         # Generate a short-lived token for password reset (same as student implementation)
-        reset_token = SuperAdminController.create_access_token(
+        reset_token = create_access_token(
             data={"sub": admin["id"], "scope": "password_reset"},
             expires_delta=timedelta(minutes=15)
         )
