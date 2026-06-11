@@ -5,8 +5,8 @@ from models.enrollment_models import EnrollmentCreate
 from models.enrollment_branch_change_models import EnrollmentBranchChangeCreate
 from models.student_models import StudentEnrollmentCreate
 from models.user_models import UserRole
-from utils.auth import require_role, get_current_active_user
-from utils.unified_auth import require_role_unified
+from utils.auth import require_role
+from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 
 router = APIRouter()
 
@@ -24,14 +24,14 @@ async def get_enrollments(
     branch_id: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
-    current_user: dict = Depends(get_current_active_user)
+    current_user: dict = Depends(get_current_user_or_superadmin),
 ):
     return await EnrollmentController.get_enrollments(student_id, course_id, branch_id, skip, limit, current_user)
 
 @router.get("/students/{student_id}/courses")
 async def get_student_courses(
     student_id: str,
-    current_user: dict = Depends(get_current_active_user)
+    current_user: dict = Depends(get_current_user_or_superadmin),
 ):
     return await EnrollmentController.get_student_courses(student_id, current_user)
 

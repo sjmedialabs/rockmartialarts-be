@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -19,13 +19,36 @@ class StudentPaymentCreate(BaseModel):
 class ConfirmRazorpayPayment(BaseModel):
     """Payload from frontend after Razorpay success to record payment and update enrollment."""
     enrollment_id: str
-    amount: float
+    amount: Optional[float] = None  # Ignored; amount is taken from enrollment (fee + admission) server-side.
     razorpay_payment_id: str
     razorpay_order_id: Optional[str] = None
     razorpay_signature: Optional[str] = None
     duration_months: Optional[int] = None  # for renewal: extend end_date by this many months
     course_name: Optional[str] = None
     branch_name: Optional[str] = None
+
+
+class BeneficiaryInput(BaseModel):
+    beneficiary_type: str = "self"  # "self" | "family" | "friend" | "other"
+    beneficiary_name: Optional[str] = None
+    beneficiary_phone: Optional[str] = None
+    beneficiary_relationship: Optional[str] = None
+
+class PrepareStudentCheckoutBody(BaseModel):
+    """Create a pending enrollment and return IDs for Razorpay (student dashboard browse → pay)."""
+    course_id: str
+    branch_id: str
+    duration: str
+    batch_ref: Optional[str] = Field(
+        None,
+        description="Branch course_schedule batch_ref or synthetic __index:n__ (matches payment-info).",
+    )
+    beneficiary: Optional[BeneficiaryInput] = None
+
+
+class CreateStudentRazorpayOrderBody(BaseModel):
+    """Create a Razorpay order for an existing pending enrollment (amount is taken from enrollment server-side)."""
+    enrollment_id: str
 
 # New models for registration payment flow
 class StudentRegistrationPayment(BaseModel):
@@ -49,6 +72,10 @@ class PaymentCalculation(BaseModel):
     total_amount: float
     currency: str = "INR"
     duration_multiplier: float = 1.0
+    # Flat price / offer fields (optional)
+    original_price: Optional[float] = None  # Price before flat offer
+    discount_amount: Optional[float] = None  # Discount = original_price - total_amount
+    is_flat_price: bool = False  # True when flat/offer price was applied
 
 class CoursePaymentInfo(BaseModel):
     course_id: str

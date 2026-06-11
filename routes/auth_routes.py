@@ -1,6 +1,14 @@
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request, status, File, UploadFile
 from controllers.auth_controller import AuthController
-from models.user_models import UserCreate, UserLogin, ForgotPassword, ResetPassword, UserUpdate, StudentProfileUpdate
+from models.user_models import (
+    UserCreate,
+    UserLogin,
+    ForgotPassword,
+    ResetPassword,
+    StudentProfileUpdate,
+    PasswordResetSendOtpBody,
+    PasswordResetVerifyOtpBody,
+)
 from pydantic import BaseModel, EmailStr
 from utils.auth import require_role, get_current_active_user
 from models.user_models import UserRole
@@ -41,6 +49,19 @@ async def forgot_password(forgot_password_data: ForgotPassword):
 async def reset_password(reset_password_data: ResetPassword):
     return await AuthController.reset_password(reset_password_data)
 
+
+@router.post("/password-reset/send-otp")
+async def password_reset_send_otp(body: PasswordResetSendOtpBody):
+    """Student mobile OTP — begins password reset (SMS)."""
+    return await AuthController.password_reset_send_otp(body.phone)
+
+
+@router.post("/password-reset/verify-otp")
+async def password_reset_verify_otp(body: PasswordResetVerifyOtpBody):
+    """Verify SMS OTP; returns short-lived reset_token for POST /auth/reset-password."""
+    return await AuthController.password_reset_verify_otp(body.phone, body.otp)
+
+
 @router.get("/me")
 async def get_current_user_info(current_user: dict = Depends(AuthController.get_current_user_info)):
     return current_user
@@ -59,6 +80,11 @@ async def update_student_profile(
     """Update current student's profile information"""
     return await AuthController.update_student_profile(profile_update, current_user)
 
-@router.put("/profile")
-async def update_profile(user_update: UserUpdate, current_user: dict = Depends(AuthController.update_profile)):
-    return current_user
+
+@router.post("/profile/photo")
+async def upload_student_profile_photo(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Upload profile photo (JPG/PNG, max ~2MB)."""
+    return await AuthController.upload_student_profile_photo(file, current_user)

@@ -1,6 +1,7 @@
 from fastapi import HTTPException, Depends, Request
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime, date
+from collections import defaultdict
 import secrets
 import uuid
 
@@ -10,6 +11,8 @@ from utils.unified_auth import require_role_unified, get_current_user_or_superad
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms, send_whatsapp
 from utils.enrollment_dates import resolve_enrollment_end_date
+from utils.subscription_dates import is_subscription_period_over
+from utils.student_branch_sync import sync_student_branch_assignment
 
 
 def _enrollment_date_to_iso(val):
@@ -21,6 +24,87 @@ def _enrollment_date_to_iso(val):
     if isinstance(val, str):
         return val
     return str(val)
+
+
+def _parse_enrollment_dt_field(val) -> Optional[datetime]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.replace(tzinfo=None) if val.tzinfo else val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
+def _enrollment_display_priority(enrollment: dict) -> int:
+    """Prefer paid/active over cancelled (aligned with student dashboard enrollment merge)."""
+    ps = str(enrollment.get("payment_status") or "").lower()
+    st = str(enrollment.get("status") or "").lower()
+    if ps in ("cancelled", "canceled", "refunded"):
+        return 0
+    if st in ("cancelled", "canceled"):
+        return 0
+    is_active = enrollment.get("is_active", True)
+    if ps == "paid" and is_active is not False:
+        return 100
+    if ps == "paid":
+        return 80
+    if ps in ("pending", "overdue", "processing"):
+        return 60
+    if ps == "failed":
+        return 40
+    return 20
+
+
+def _enrollment_recency_ts(en: dict) -> float:
+    for k in ("start_date", "enrollment_date", "updated_at", "created_at"):
+        d = _parse_enrollment_dt_field(en.get(k))
+        if d:
+            return d.timestamp()
+    return 0.0
+
+
+def _select_primary_enrollment(enrollments: list) -> Optional[dict]:
+    if not enrollments:
+        return None
+    if len(enrollments) == 1:
+        return enrollments[0]
+    return max(
+        enrollments,
+        key=lambda e: (_enrollment_display_priority(e), _enrollment_recency_ts(e)),
+    )
+
+
+def _derive_enrollment_status(enrollment: dict) -> str:
+    """
+    Derive human status from persisted fields when `status` is missing/stale.
+    Priority:
+    1) explicit `status` (if present)
+    2) canceled / paused by payment_status
+    3) expired by end_date
+    4) active/inactive by is_active
+    """
+    explicit = str(enrollment.get("status") or "").strip().lower()
+    is_active = bool(enrollment.get("is_active", True))
+    payment_status = str(enrollment.get("payment_status") or "").strip().lower()
+    if payment_status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if payment_status == "paused":
+        return "paused"
+
+    if is_subscription_period_over(enrollment.get("end_date")):
+        return "expired"
+
+    if not is_active:
+        return "inactive"
+
+    if explicit in {"completed", "paused", "cancelled", "canceled", "inactive", "active"}:
+        return explicit.replace("canceled", "cancelled")
+
+    return "active"
 
 
 class UserController:
@@ -86,7 +170,6 @@ class UserController:
             "last_name": user_data.last_name,
             "full_name": full_name,
             "role": user_data.role.value,  # Convert enum to string
-            "biometric_id": user_data.biometric_id,
             "is_active": True,
             "date_of_birth": user_data.date_of_birth.isoformat() if user_data.date_of_birth else None,
             "gender": user_data.gender,
@@ -94,6 +177,17 @@ class UserController:
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        if user_data.biometric_id:
+            b = str(user_data.biometric_id).strip()
+            if b:
+                user_dict["biometric_id"] = b
+                user_dict["essl_user_id"] = b
+        if getattr(user_data, "essl_user_id", None):
+            v = str(user_data.essl_user_id).strip()
+            if v:
+                user_dict["essl_user_id"] = v
+                if not user_dict.get("biometric_id"):
+                    user_dict["biometric_id"] = v
         # Admin-created students should use onboarding link until they complete it (not website self-registration)
         if user_data.role == UserRole.STUDENT:
             user_dict["has_credentials"] = False
@@ -126,6 +220,8 @@ class UserController:
             user_dict["address"] = user_data.address
         if user_data.emergency_contact is not None:
             user_dict["emergency_contact"] = user_data.emergency_contact
+        if user_data.role == UserRole.STUDENT and user_data.student_level:
+            user_dict["student_level"] = user_data.student_level
 
         await db.users.insert_one(user_dict)
 
@@ -371,39 +467,41 @@ class UserController:
     async def handle_enrollment_updates(user_id: str, course_data: dict, branch_data: dict):
         """Handle enrollment record updates when course/branch data changes"""
         db = get_db()
+        branch_id = (branch_data or {}).get("branch_id")
+        if not branch_id:
+            return
+
+        target_user = await db.users.find_one({"id": user_id})
+        old_branch_id = None
+        if target_user:
+            old_branch_id = target_user.get("branch_id") or (target_user.get("branch") or {}).get("branch_id")
 
         try:
-            # Check if user has existing active enrollments
             existing_enrollments = await db.enrollments.find({
                 "student_id": user_id,
                 "is_active": True
             }).to_list(100)
 
-            if course_data and branch_data:
+            if course_data:
                 course_id = course_data.get("course_id")
-                branch_id = branch_data.get("branch_id")
-
-                if course_id and branch_id:
-                    # Check if enrollment already exists for this course/branch combination
+                if course_id:
                     existing_enrollment = None
                     for enrollment in existing_enrollments:
-                        if (enrollment.get("course_id") == course_id and
-                            enrollment.get("branch_id") == branch_id):
+                        if enrollment.get("course_id") == course_id:
                             existing_enrollment = enrollment
                             break
 
                     if existing_enrollment:
-                        # Update existing enrollment
                         await db.enrollments.update_one(
                             {"id": existing_enrollment["id"]},
                             {"$set": {
+                                "branch_id": branch_id,
                                 "updated_at": datetime.utcnow(),
                                 "is_active": True
                             }}
                         )
-                        print(f"✅ Updated existing enrollment: {existing_enrollment['id']}")
+                        print(f"✅ Updated existing enrollment branch: {existing_enrollment['id']}")
                     else:
-                        # Create new enrollment record
                         from models.enrollment_models import Enrollment, PaymentStatus
 
                         duration_ref = course_data.get("duration")
@@ -431,18 +529,60 @@ class UserController:
                         await db.enrollments.insert_one(enrollment_doc)
                         print(f"✅ Created new enrollment: {enrollment.id}")
 
-                        # Deactivate other enrollments for this student
                         for old_enrollment in existing_enrollments:
                             if old_enrollment["id"] != enrollment.id:
                                 await db.enrollments.update_one(
                                     {"id": old_enrollment["id"]},
                                     {"$set": {"is_active": False, "updated_at": datetime.utcnow()}}
                                 )
-                                print(f"✅ Deactivated old enrollment: {old_enrollment['id']}")
 
+            await sync_student_branch_assignment(
+                db, user_id, branch_id, old_branch_id=old_branch_id
+            )
         except Exception as e:
             print(f"❌ Error handling enrollment updates: {e}")
-            # Don't fail the user update if enrollment handling fails
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update student branch enrollment records",
+            ) from e
+
+    @staticmethod
+    async def _apply_enrollment_dates(
+        user_id: str,
+        start_d: Optional[date],
+        end_d: Optional[date],
+    ):
+        """Update start/end on the student's primary active enrollment."""
+        db = get_db()
+        enr = await db.enrollments.find_one({"student_id": user_id, "is_active": True})
+        if not enr:
+            raise HTTPException(
+                status_code=400,
+                detail="No active enrollment found; assign a course before setting dates.",
+            )
+
+        def as_dt(val):
+            if val is None:
+                return None
+            if isinstance(val, datetime):
+                return val
+            if isinstance(val, date):
+                return datetime.combine(val, datetime.min.time())
+            return val
+
+        cur_start = as_dt(enr.get("start_date"))
+        cur_end = as_dt(enr.get("end_date"))
+        eff_start = datetime.combine(start_d, datetime.min.time()) if start_d is not None else cur_start
+        eff_end = datetime.combine(end_d, datetime.min.time()) if end_d is not None else cur_end
+        if eff_start and eff_end and eff_end < eff_start:
+            raise HTTPException(status_code=400, detail="End date must be on or after start date.")
+
+        sets: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+        if start_d is not None:
+            sets["start_date"] = eff_start
+        if end_d is not None:
+            sets["end_date"] = eff_end
+        await db.enrollments.update_one({"id": enr["id"]}, {"$set": sets})
 
     @staticmethod
     async def update_user(
@@ -535,6 +675,12 @@ class UserController:
 
         # Convert user_update to dict and handle date serialization
         update_dict = user_update.dict(exclude_unset=True)
+        enrollment_start_date = update_dict.pop("enrollment_start_date", None)
+        enrollment_end_date = update_dict.pop("enrollment_end_date", None)
+        enrollment_dates_requested = (
+            enrollment_start_date is not None or enrollment_end_date is not None
+        )
+
         update_data = {}
 
         for k, v in update_dict.items():
@@ -584,8 +730,13 @@ class UserController:
             else:
                 update_data[k] = v
 
-        if not update_data:
+        if not update_data and not enrollment_dates_requested:
             raise HTTPException(status_code=400, detail="No update data provided")
+
+        if target_user.get("role") == UserRole.STUDENT.value and enrollment_dates_requested:
+            await UserController._apply_enrollment_dates(
+                user_id, enrollment_start_date, enrollment_end_date
+            )
 
         # Auto-generate full_name if first_name or last_name is being updated
         if "first_name" in update_data or "last_name" in update_data:
@@ -598,25 +749,59 @@ class UserController:
             update_data["full_name"] = full_name
             print(f"🔄 Auto-generated full_name: '{full_name}' from first_name: '{current_first_name}', last_name: '{current_last_name}'")
 
+        if not update_data:
+            update_data = {}
         update_data["updated_at"] = datetime.utcnow()
+
+        # Sparse unique indexes still index explicit BSON null; clear mapping with $unset instead of $set null.
+        unset_fields: Dict[str, str] = {}
+        for key in ("biometric_id", "essl_user_id"):
+            if key not in update_data:
+                continue
+            val = update_data[key]
+            if val is None or (isinstance(val, str) and not str(val).strip()):
+                unset_fields[key] = ""
+                del update_data[key]
+
+        mongo_update: Dict[str, Any] = {}
+        if update_data:
+            mongo_update["$set"] = update_data
+        if unset_fields:
+            mongo_update["$unset"] = unset_fields
+
+        new_branch_id = update_data.get("branch_id") or (update_data.get("branch") or {}).get("branch_id")
+        old_branch_id = target_user.get("branch_id") or (target_user.get("branch") or {}).get("branch_id")
+        branch_changed = (
+            target_user.get("role") == UserRole.STUDENT.value
+            and new_branch_id
+            and new_branch_id != old_branch_id
+        )
 
         # Handle enrollment updates if course/branch data is being changed
         if target_user.get("role") == "student" and ("course" in update_data or "branch" in update_data):
             course_data = update_data.get("course", {})
             branch_data = update_data.get("branch", {})
 
-            # Only handle enrollment if both course and branch data are provided
-            if course_data and branch_data:
+            if branch_data and branch_data.get("branch_id"):
                 await UserController.handle_enrollment_updates(user_id, course_data, branch_data)
+            elif branch_changed:
+                await sync_student_branch_assignment(
+                    get_db(), user_id, new_branch_id, old_branch_id=old_branch_id
+                )
 
         result = await get_db().users.update_one(
             {"id": user_id},
-            {"$set": update_data}
+            mongo_update,
         )
 
         if result.matched_count == 0:
             # This case should be rare due to the check above, but it's good practice
             raise HTTPException(status_code=404, detail="User not found")
+
+        if branch_changed and "branch" not in update_data:
+            await sync_student_branch_assignment(
+                get_db(), user_id, new_branch_id, old_branch_id=old_branch_id
+            )
         
         await log_activity(
             request=request,
@@ -682,6 +867,86 @@ class UserController:
         await send_whatsapp(target_user["phone"], message)
 
         return {"message": f"Password for user {target_user['full_name']} has been reset and sent to them."}
+
+    @staticmethod
+    async def send_student_notification(
+        user_id: str,
+        kind: str,
+        request: Request,
+        current_user: dict = None,
+    ):
+        """Welcome / payment reminder SMS + WhatsApp (super admin only via route)."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        db = get_db()
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user.get("role") != UserRole.STUDENT.value:
+            raise HTTPException(status_code=400, detail="Target user is not a student")
+
+        phone = (user.get("phone") or "").strip()
+        if not phone:
+            raise HTTPException(status_code=400, detail="Student has no phone number on file")
+
+        name = (user.get("full_name") or "").strip() or f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or "Student"
+
+        enrollments = await db.enrollments.find({"student_id": user_id}).sort([("updated_at", -1)]).to_list(80)
+        primary = _select_primary_enrollment(enrollments) if enrollments else None
+        course_name = "your course"
+        validity_note = ""
+        branch_note = ""
+        if primary:
+            cid = primary.get("course_id")
+            if cid:
+                cdoc = await db.courses.find_one({"id": cid})
+                if cdoc:
+                    course_name = cdoc.get("title") or cdoc.get("name") or course_name
+            ed = primary.get("end_date")
+            if ed:
+                iso = _enrollment_date_to_iso(ed)
+                if iso:
+                    validity_note = f" Validity ends {str(iso)[:10]}."
+            bid = primary.get("branch_id")
+            if bid:
+                bdoc = await db.branches.find_one({"id": bid})
+                if bdoc:
+                    bn = (bdoc.get("branch") or {}).get("name") or bdoc.get("name")
+                    if bn:
+                        branch_note = f" Branch: {bn}."
+
+        if kind == "welcome":
+            msg = (
+                f"Hello {name}, welcome to Rock Martial Arts Academy! "
+                f"You are enrolled in {course_name}.{branch_note}{validity_note} "
+                f"We are glad to have you — train safe!"
+            )
+        elif kind == "payment_reminder":
+            msg = (
+                f"Hi {name}, friendly reminder from Rock Martial Arts Academy regarding fees for {course_name}.{branch_note}{validity_note} "
+                f"Please complete payment when you can. Thank you!"
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid notification kind")
+
+        ok_wa = await send_whatsapp(phone, msg)
+        ok_sms = await send_sms(phone, msg)
+
+        await log_activity(
+            request=request,
+            action="admin_student_notify",
+            user_id=current_user["id"],
+            user_name=current_user.get("full_name"),
+            details={"target_student_id": user_id, "kind": kind, "whatsapp_ok": ok_wa, "sms_ok": ok_sms},
+        )
+
+        label = "Welcome message sent" if kind == "welcome" else "Payment reminder sent"
+        return {
+            "message": f"{label} (SMS and WhatsApp channels).",
+            "whatsapp": ok_wa,
+            "sms": ok_sms,
+        }
 
     @staticmethod
     async def deactivate_user(
@@ -795,7 +1060,8 @@ class UserController:
     @staticmethod
     async def get_student_details(
         current_user: dict,
-        unassigned_only: bool = False
+        unassigned_only: bool = False,
+        branch_id: Optional[str] = None,
     ):
         """Get detailed student information with course enrollment data (Authenticated endpoint).
         When unassigned_only=True, returns only students with no active branch enrollment (for Assign to Branch modal)."""
@@ -818,7 +1084,9 @@ class UserController:
             if current_role not in (UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER):
                 return {"message": "No students found", "students": [], "total": 0}
             assigned_student_ids = await db.enrollments.distinct("student_id", {"is_active": True})
-            query = {"role": "student", "is_active": True, "id": {"$nin": assigned_student_ids}}
+            # Include all student users (active/inactive); admins may need to assign/enroll newly
+            # registered students before account activation is toggled.
+            query = {"role": "student", "id": {"$nin": assigned_student_ids}}
             students_cursor = db.users.find(query).sort("created_at", -1)
             students = await students_cursor.to_list(1000)
             if not students:
@@ -864,6 +1132,7 @@ class UserController:
                     "branch_info": None,
                     "courses": [],
                     "course_info": None,
+                    "student_level": student.get("student_level"),
                 })
             return {
                 "message": "Unassigned students",
@@ -872,8 +1141,9 @@ class UserController:
             }
 
         # Build query based on user role (normal listing)
-        # Same users collection as public registration; website students have role "student" and is_active True
-        query = {"role": "student", "is_active": True}
+        # Same users collection as public registration; include active + inactive students
+        # so super admin can edit/assign/enroll newly registered accounts.
+        query = {"role": "student"}
 
         # Apply branch filtering for non-super-admin users
         if current_role != UserRole.SUPER_ADMIN:
@@ -921,11 +1191,17 @@ class UserController:
                 # Store for later use in enrollment filtering
                 managed_branch_ids_for_students = managed_branch_ids
             else:
-                # For other roles (coaches, etc.), use their branch_id
+                # Coaches: students with active enrollments at the coach's branch
                 user_branch_id = current_user.get("branch_id")
                 if not user_branch_id:
                     raise HTTPException(status_code=403, detail="User not assigned to any branch")
-                query["branch_id"] = user_branch_id
+                coach_student_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {"branch_id": user_branch_id, "is_active": True},
+                )
+                if not coach_student_ids:
+                    return {"message": "No students found", "students": [], "total": 0}
+                query["id"] = {"$in": coach_student_ids}
 
         # Get students (newest first)
         students_cursor = db.users.find(query).sort("created_at", -1)
@@ -988,46 +1264,59 @@ class UserController:
             # Get course information from multiple sources
             courses_info = []
 
-            # Method 1: Check for enrollments in enrollments collection
-            enrollments = await (
-                db.enrollments.find({"student_id": student_id, "is_active": True})
-                .sort("enrollment_date", -1)
+            # All enrollment rows (inactive/cancelled included); one display row per course+branch using same
+            # primary rules as student dashboard merge (paid beats cancelled — avoids mismatched dates/status).
+            all_enrollments = await (
+                db.enrollments.find({"student_id": student_id})
+                .sort([("updated_at", -1), ("enrollment_date", -1)])
                 .to_list(100)
             )
 
-            for enrollment in enrollments:
+            groups = defaultdict(list)
+            for e in all_enrollments:
+                groups[(e.get("course_id"), e.get("branch_id"))].append(e)
+
+            for (_cid, _bid), group in groups.items():
+                enrollment = _select_primary_enrollment(group)
+                if not enrollment or not enrollment.get("is_active", True):
+                    continue
                 course = await db.courses.find_one({"id": enrollment["course_id"]})
-                if course:
-                    # Calculate duration from enrollment dates
-                    duration_days = None
-                    if enrollment.get("start_date") and enrollment.get("end_date"):
-                        start_date = enrollment["start_date"]
-                        end_date = enrollment["end_date"]
-                        if isinstance(start_date, str):
-                            start_date = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                        if isinstance(end_date, str):
-                            end_date = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                        duration_days = (end_date - start_date).days
+                if not course:
+                    continue
+                duration_days = None
+                if enrollment.get("start_date") and enrollment.get("end_date"):
+                    start_date = enrollment["start_date"]
+                    end_date = enrollment["end_date"]
+                    if isinstance(start_date, str):
+                        start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                    if isinstance(end_date, str):
+                        end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    duration_days = (end_date - start_date).days
 
-                    duration_label = None
-                    did = enrollment.get("duration_id")
-                    if did:
-                        ddoc = await db.durations.find_one({"id": did})
-                        if ddoc:
-                            duration_label = ddoc.get("name") or ddoc.get("code")
+                duration_label = None
+                did = enrollment.get("duration_id")
+                if did:
+                    ddoc = await db.durations.find_one({"id": did})
+                    if not ddoc:
+                        ddoc = await db.durations.find_one({"code": did})
+                    if ddoc:
+                        duration_label = ddoc.get("name") or ddoc.get("code")
 
-                    # Determine level from course difficulty
-                    level = course.get("difficulty_level", "Beginner")
+                level = course.get("difficulty_level", "Beginner")
 
-                    courses_info.append({
-                        "course_id": enrollment["course_id"],
-                        "course_name": course.get("title", "Unknown Course"),
-                        "level": level,
-                        "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
-                        "enrollment_date": enrollment.get("enrollment_date"),
-                        "payment_status": enrollment.get("payment_status", "pending"),
-                        "branch_id": enrollment.get("branch_id")
-                    })
+                courses_info.append({
+                    "enrollment_id": enrollment.get("id"),
+                    "course_id": enrollment["course_id"],
+                    "course_name": course.get("title", "Unknown Course"),
+                    "level": level,
+                    "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
+                    "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
+                    "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
+                    "enrollment_date": enrollment.get("enrollment_date"),
+                    "payment_status": enrollment.get("payment_status", "pending"),
+                    "is_active": enrollment.get("is_active", True),
+                    "branch_id": enrollment.get("branch_id"),
+                })
 
             # DEPRECATED: Legacy fallback for students with course data in user documents
             # This will be removed after data migration is complete
@@ -1067,11 +1356,19 @@ class UserController:
                         "source": "legacy_user_document"  # Mark as legacy data for migration tracking
                     })
 
-            # Resolve branch_info (branch name) for list display - from first enrollment, user.branch, or user.branch_id
+            # Resolve branch_info — primary active enrollment only (matches Branch column)
             branch_info_response = None
             branch_id_for_name = None
-            if enrollments:
-                branch_id_for_name = enrollments[0].get("branch_id")
+            active_enrollments_only = [
+                e for e in all_enrollments if e.get("is_active", True)
+            ]
+            row_primary = (
+                _select_primary_enrollment(active_enrollments_only)
+                if active_enrollments_only
+                else None
+            )
+            if row_primary:
+                branch_id_for_name = row_primary.get("branch_id")
             if not branch_id_for_name and student.get("branch", {}).get("branch_id"):
                 branch_id_for_name = student["branch"]["branch_id"]
             if not branch_id_for_name and student.get("branch_id"):
@@ -1085,7 +1382,7 @@ class UserController:
                         "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch")
                     }
 
-            primary_enrollment = enrollments[0] if enrollments else None
+            primary_enrollment = row_primary
             start_date_out = _enrollment_date_to_iso(primary_enrollment.get("start_date")) if primary_enrollment else None
             end_date_out = _enrollment_date_to_iso(primary_enrollment.get("end_date")) if primary_enrollment else None
 
@@ -1108,15 +1405,30 @@ class UserController:
                 "has_credentials": bool(student.get("has_credentials", True)),
                 "start_date": start_date_out,
                 "end_date": end_date_out,
-                "branch_id": student.get("branch_id"),
+                "primary_enrollment_id": primary_enrollment.get("id") if primary_enrollment else None,
+                "subscription_payment_status": primary_enrollment.get("payment_status") if primary_enrollment else None,
+                "branch_id": branch_id_for_name or student.get("branch_id"),
                 "branch_info": branch_info_response,
                 "address": student.get("address"),
                 "courses": courses_info,
                 "enrollments": courses_info,  # For compatibility with frontend
-                "action": "view_profile"  # Default action - can be customized based on requirements
+                "action": "view_profile",  # Default action - can be customized based on requirements
+                "student_level": student.get("student_level"),
             }
 
             enriched_students.append(student_details)
+
+        if (
+            branch_id
+            and branch_id != "all"
+            and current_role == UserRole.SUPER_ADMIN
+        ):
+            enriched_students = [
+                s
+                for s in enriched_students
+                if (s.get("branch_info") or {}).get("branch_id") == branch_id
+                or s.get("branch_id") == branch_id
+            ]
 
         return {
             "message": f"Retrieved {len(enriched_students)} student details successfully",
@@ -1178,16 +1490,22 @@ class UserController:
                 # Get branch details
                 branch = await db.branches.find_one({"id": enrollment.get("branch_id")})
 
+                derived_status = _derive_enrollment_status(enrollment)
                 enhanced_enrollment = serialize_doc(enrollment)
                 enhanced_enrollment.update({
                     "course_name": course.get("title", course.get("name", "Unknown Course")) if course else "Unknown Course",
                     "course_difficulty": course.get("difficulty_level", "Beginner") if course else "Beginner",
                     "branch_name": branch.get("branch", {}).get("name", "Unknown Branch") if branch else "Unknown Branch",
                     "enrollment_date": enrollment.get("enrollment_date", enrollment.get("created_at", "")),
+                    "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
+                    "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
                     "completion_date": enrollment.get("completion_date"),
-                    "status": enrollment.get("status", "active"),
+                    "status": derived_status,
                     "progress": enrollment.get("progress", 0),
-                    "is_active": enrollment.get("is_active", True)
+                    "is_active": enrollment.get("is_active", True),
+                    "payment_status": enrollment.get("payment_status"),
+                    "updated_at": _enrollment_date_to_iso(enrollment.get("updated_at")),
+                    "created_at": _enrollment_date_to_iso(enrollment.get("created_at")),
                 })
                 enhanced_enrollments.append(enhanced_enrollment)
 

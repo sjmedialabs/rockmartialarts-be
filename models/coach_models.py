@@ -59,6 +59,11 @@ class CoachCreate(BaseModel):
     branch_id: Optional[str] = None  # Branch assignment for the coach
     assignment_details: Optional[AssignmentDetails] = None  # Course assignments and other details
     emergency_contact: Optional[EmergencyContact] = None  # Emergency contact information
+    profile_image_url: Optional[str] = None
+    about_short: Optional[str] = None
+    featured_on_homepage: bool = False
+    homepage_rating: Optional[float] = None
+    display_order: Optional[int] = None
 
 class CoachUpdate(BaseModel):
     personal_info: Optional[PersonalInfo] = None
@@ -70,6 +75,11 @@ class CoachUpdate(BaseModel):
     assignment_details: Optional[AssignmentDetails] = None  # Course assignments and other details
     emergency_contact: Optional[EmergencyContact] = None  # Emergency contact information
     is_active: Optional[bool] = None  # Coach active/inactive status
+    profile_image_url: Optional[str] = None
+    about_short: Optional[str] = None
+    featured_on_homepage: Optional[bool] = None
+    homepage_rating: Optional[float] = None
+    display_order: Optional[int] = None
 
 class CoachLogin(BaseModel):
     email: EmailStr
@@ -100,6 +110,11 @@ class Coach(BaseModel):
     role: str = "coach"  # Fixed as coach
     is_active: bool = True
     password_hash: str  # Hashed password
+    profile_image_url: Optional[str] = None
+    about_short: Optional[str] = None
+    featured_on_homepage: bool = False
+    homepage_rating: Optional[float] = None
+    display_order: Optional[int] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -115,6 +130,11 @@ class CoachResponse(BaseModel):
     emergency_contact: Optional[EmergencyContact] = None  # Emergency contact information
     full_name: str
     is_active: bool
+    profile_image_url: Optional[str] = None
+    about_short: Optional[str] = None
+    featured_on_homepage: bool = False
+    homepage_rating: Optional[float] = None
+    display_order: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 

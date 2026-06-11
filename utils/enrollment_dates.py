@@ -6,6 +6,40 @@ from typing import Optional
 DEFAULT_ENROLLMENT_DAYS = 365
 
 
+async def enrollment_subscription_end_after_payment(db, enrollment: dict) -> Optional[datetime]:
+    """
+    Authoritative subscription end after checkout payment: duration catalog + enrollment start.
+    Does not use client-supplied month counts (those duplicated renewals / inflated validity).
+    """
+    dur_ref = enrollment.get("duration_id")
+    if not dur_ref:
+        return None
+    raw_start = enrollment.get("start_date") or enrollment.get("enrollment_date")
+    if raw_start is None:
+        return None
+    if isinstance(raw_start, str):
+        try:
+            start_naive = datetime.fromisoformat(raw_start.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    elif isinstance(raw_start, datetime):
+        start_naive = raw_start.replace(tzinfo=None) if raw_start.tzinfo else raw_start
+    else:
+        return None
+
+    months_hint = None
+    dr = await db.durations.find_one({"id": str(dur_ref)})
+    if not dr:
+        dr = await db.durations.find_one({"code": str(dur_ref)})
+    if dr and dr.get("duration_months") is not None:
+        try:
+            months_hint = int(dr["duration_months"])
+        except (TypeError, ValueError):
+            months_hint = None
+
+    return await resolve_enrollment_end_date(db, str(dur_ref), start_naive, months_hint=months_hint)
+
+
 def _parse_months_from_slug(s: str) -> Optional[int]:
     """Parse strings like 1-month, 3-months, 12m into month count."""
     if not s or not str(s).strip():

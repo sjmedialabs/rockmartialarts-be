@@ -34,6 +34,8 @@ class BranchPriceEntry(BaseModel):
     fee_1_year: Optional[float] = None
     # New: flexible per-duration fees keyed by duration id/code (used by tenure UI)
     fee_per_duration: Optional[Dict[str, float]] = None
+    # Flat/offer price per duration (overrides calculated fee when present)
+    flat_price_per_duration: Optional[Dict[str, float]] = None
 
 
 class Pricing(BaseModel):
@@ -47,6 +49,8 @@ class Pricing(BaseModel):
     branch_prices: Optional[List[BranchPriceEntry]] = None
     # New: flexible per-duration fees keyed by duration id/code (used by tenure UI)
     fee_per_duration: Optional[Dict[str, float]] = None
+    # Flat/offer price per duration (overrides calculated fee when present)
+    flat_price_per_duration: Optional[Dict[str, float]] = None
 
 class Settings(BaseModel):
     offers_certification: bool

@@ -58,8 +58,23 @@ class AssignmentBatch(BaseModel):
     )
     batch_fee: Optional[float] = Field(
         default=None,
-        validation_alias=AliasChoices("batch_fee", "fee", "price"),
+        validation_alias=AliasChoices("batch_fee", "batchFee", "fee", "price"),
         description="Per-batch course fee at this branch (overrides tenure-based fee when set).",
+    )
+    fee_per_duration: Optional[Dict[str, float]] = Field(
+        default=None,
+        validation_alias=AliasChoices("fee_per_duration", "feePerDuration"),
+        description="Per-duration pricing: { duration_id: fee_amount }.",
+    )
+    pricing_type_per_duration: Optional[Dict[str, str]] = Field(
+        default=None,
+        validation_alias=AliasChoices("pricing_type_per_duration", "pricingTypePerDuration"),
+        description="Per-duration pricing type: { duration_id: 'monthly' | 'flat' }.",
+    )
+    enabled_per_duration: Optional[Dict[str, bool]] = Field(
+        default=None,
+        validation_alias=AliasChoices("enabled_per_duration", "enabledPerDuration"),
+        description="Per-duration enable/disable map: { duration_id: true|false }.",
     )
 
 

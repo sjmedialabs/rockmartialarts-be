@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 
 class SendOtpBody(BaseModel):
-    phone: str = Field(..., min_length=8, max_length=20)
+    """Client sends E.164 Indian mobile (+91 + 10 digits) or national variants normalized server-side."""
+    phone: str = Field(..., min_length=10, max_length=20)
 
 
 class VerifyOtpBody(BaseModel):

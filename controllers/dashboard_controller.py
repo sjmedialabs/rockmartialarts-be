@@ -90,24 +90,12 @@ class DashboardController:
             if current_user["role"] == "branch_manager":
                 managed_branch_ids = filter_query.get("branch_id", {}).get("$in", [])
                 if managed_branch_ids:
-                    # Count students in managed branches
-                    active_students = await db.users.count_documents({
-                        "role": "student",
-                        "is_active": True,
-                        "branch_id": {"$in": managed_branch_ids}
-                    })
-
-                    # Also count students from enrollments if users don't have branch_id
-                    enrollment_students = await db.enrollments.find({
-                        "is_active": True,
-                        "branch_id": {"$in": managed_branch_ids}
-                    }).distinct("student_id")
-
-                    # Get unique student count from enrollments
-                    enrollment_student_count = len(set(enrollment_students)) if enrollment_students else 0
-
-                    # Use the higher count (some students might not have branch_id in users collection)
-                    active_students = max(active_students, enrollment_student_count)
+                    active_students = len(
+                        await db.enrollments.distinct(
+                            "student_id",
+                            {"is_active": True, "branch_id": {"$in": managed_branch_ids}},
+                        )
+                    )
 
                     # Total users count for branch manager
                     total_users = await db.users.count_documents({
@@ -118,12 +106,19 @@ class DashboardController:
                     active_students = 0
                     total_users = 0
             else:
-                # For other roles, use existing logic
-                active_students = await db.users.count_documents({
-                    "role": "student",
-                    "is_active": True,
-                    **filter_query
-                })
+                branch_filter = filter_query.get("branch_id")
+                if branch_filter:
+                    active_students = len(
+                        await db.enrollments.distinct(
+                            "student_id",
+                            {"is_active": True, "branch_id": branch_filter},
+                        )
+                    )
+                else:
+                    active_students = await db.users.count_documents({
+                        "role": "student",
+                        "is_active": True,
+                    })
 
                 total_users = await db.users.count_documents({
                     "is_active": True,
@@ -412,9 +407,9 @@ class DashboardController:
             }).sort("created_at", -1).limit(limit).to_list(length=limit)
             
             # Get recent payments
-            recent_payments = await db.payments.find({
-                "payment_status": "completed"
-            }).sort("payment_date", -1).limit(limit).to_list(length=limit)
+            recent_payments = await db.payments.find(
+                {"payment_status": {"$in": ["completed", "paid"]}}
+            ).sort("payment_date", -1).limit(limit).to_list(length=limit)
             
             return {
                 "recent_enrollments": serialize_doc(recent_enrollments),

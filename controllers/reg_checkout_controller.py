@@ -9,27 +9,31 @@ Mongo collections (isolated from LMS `users`):
 
 from __future__ import annotations
 
-import hmac
-import hashlib
 import logging
 import os
 import random
 import string
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import jwt
-import razorpay
 from fastapi import HTTPException
 from passlib.context import CryptContext
 
 from models.reg_checkout_models import CreateRegOrderBody, VerifyOtpBody, VerifyRegPaymentBody
 from utils.database import get_db
+from utils.indian_phone import (
+    canonical_indian_phone,
+    otp_phone_variants,
+    subscriber_phone_lookup_filter,
+    subscriber_phone_matches,
+)
 from utils.reg_checkout_sms import (
     public_sms_failure_hint,
     send_registration_sms,
     sms_provider_expects_delivery,
 )
+from utils.razorpay_client import get_razorpay_client, verify_razorpay_signature
 
 logger = logging.getLogger(__name__)
 
@@ -42,42 +46,30 @@ COL_OTP = "reg_checkout_otp"
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "student_management_secret_key_2025_secure")
 JWT_ALG = "HS256"
-OTP_TTL_MIN = 10
-RESEND_COOLDOWN_SEC = 60
+# OTP code validity (minutes); clamp 5–15 per ops-friendly defaults
+OTP_TTL_MIN = max(
+    5, min(15, int(os.getenv("REG_CHECKOUT_OTP_TTL_MIN", "10")))
+)
+RESEND_COOLDOWN_SEC = int(os.getenv("REG_CHECKOUT_RESEND_COOLDOWN_SEC", "30"))
+# Post-verify JWT for create-order / verify-payment (do not tie to OTP TTL)
+VERIFICATION_JWT_HOURS = int(os.getenv("REG_CHECKOUT_VERIFY_JWT_HOURS", "24"))
+JWT_DECODE_LEEWAY_SEC = int(os.getenv("REG_CHECKOUT_JWT_LEEWAY_SEC", "120"))
 
 REQUIRE_OTP = os.getenv("REG_CHECKOUT_REQUIRE_OTP", "true").lower() in ("1", "true", "yes")
 
 
-def _razorpay_client() -> razorpay.Client:
-    key = os.getenv("RAZORPAY_KEY_ID", "").strip()
-    sec = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
-    if not key or not sec:
-        raise HTTPException(
-            status_code=503,
-            detail="Razorpay is not configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET).",
-        )
-    return razorpay.Client(auth=(key, sec))
-
-
-def _normalize_phone(phone: str) -> str:
-    raw = (phone or "").strip()
-    digits = "".join(c for c in raw if c.isdigit())
-    if len(digits) >= 10:
-        return digits[-10:] if len(digits) > 10 else digits
-    return digits or raw
-
-
 def _issue_phone_token(phone: str) -> str:
-    norm = _normalize_phone(phone)
-    return jwt.encode(
-        {
-            "sub": norm,
-            "scope": "reg_checkout",
-            "exp": datetime.utcnow() + timedelta(hours=1),
-        },
-        SECRET_KEY,
-        algorithm=JWT_ALG,
-    )
+    norm = canonical_indian_phone(phone)
+    if not norm:
+        raise HTTPException(status_code=400, detail="Invalid phone number.")
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": norm,
+        "scope": "reg_checkout",
+        "iat": now,
+        "exp": now + timedelta(hours=VERIFICATION_JWT_HOURS),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALG)
 
 
 def _verify_phone_token(token: Optional[str], phone: str) -> None:
@@ -85,22 +77,25 @@ def _verify_phone_token(token: Optional[str], phone: str) -> None:
         return
     if not token:
         raise HTTPException(status_code=401, detail="Phone verification required (missing token).")
-    norm = _normalize_phone(phone)
+    norm = canonical_indian_phone(phone)
+    if not norm:
+        raise HTTPException(status_code=401, detail="Invalid phone number.")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALG])
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[JWT_ALG],
+            leeway=JWT_DECODE_LEEWAY_SEC,
+        )
         if payload.get("scope") != "reg_checkout" or str(payload.get("sub")) != norm:
             raise HTTPException(status_code=403, detail="Invalid phone verification.")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Phone verification expired. Please verify your number again from the OTP step.",
+        )
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired phone verification.")
-
-
-def _verify_razorpay_signature(order_id: str, pay_id: str, signature: str) -> bool:
-    sec = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
-    if not sec:
-        return False
-    body = f"{order_id}|{pay_id}".encode("utf-8")
-    expected = hmac.new(sec.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature or "")
 
 
 def _dlt_template_id_primary_legacy(primary_key: str, legacy_key: str) -> Optional[str]:
@@ -157,6 +152,113 @@ def _otp_sms_message(otp: str) -> str:
     )
 
 
+def _sms_dlt_template_id(kind: str) -> Optional[str]:
+    """
+    DLT template id for transactional SMS (welcome, payment, reminder).
+    Uses the same resolution path as OTP: kind-specific env → optional shared
+    DLT_TRANSACTIONAL_TEMPLATE_ID → DLT_OTP_TEMPLATE_ID so smslogin always gets
+    a templateid when OTP SMS is already configured.
+    For Indian DLT, the SMS body must match the template registered for that id.
+    """
+    if kind == "welcome":
+        tid = _dlt_template_id_primary_legacy("DLT_WELCOME_TEMPLATE_ID", "DLT_TEMPLATE_WELCOME")
+    elif kind == "payment":
+        tid = _dlt_template_id_primary_legacy("DLT_PAYMENT_TEMPLATE_ID", "DLT_TEMPLATE_PAYMENT_CONFIRMED")
+    elif kind == "reminder":
+        tid = _dlt_template_id_primary_legacy("DLT_REMINDER_TEMPLATE_ID", "DLT_TEMPLATE_REMINDER")
+    else:
+        tid = None
+    if tid:
+        return tid
+    tx = os.getenv("DLT_TRANSACTIONAL_TEMPLATE_ID", "").strip()
+    if tx:
+        return tx
+    otp_tid = _otp_dlt_template_id()
+    if otp_tid and kind != "otp":
+        logger.warning(
+            "SMS kind=%s: using DLT_OTP_TEMPLATE_ID — set DLT_%s_TEMPLATE_ID or "
+            "DLT_TRANSACTIONAL_TEMPLATE_ID if this message uses a different DLT template.",
+            kind,
+            kind.upper(),
+        )
+    return otp_tid
+
+
+def _welcome_sms_text(name: str, course_name: str, duration: str) -> str:
+    tpl = os.getenv("DLT_WELCOME_MESSAGE", "").strip()
+    if tpl:
+        try:
+            return tpl % {
+                "name": name.strip(),
+                "course_name": course_name,
+                "duration": duration,
+            }
+        except Exception:
+            logger.exception("DLT_WELCOME_MESSAGE format failed; using default body")
+    return (
+        f"ROCK MARTIAL ARTS ACADEMY: Welcome {name.strip()}! Your registration for "
+        f"{course_name} – {duration} is confirmed. Get ready to train hard and grow stronger every day. See you in class!"
+    )
+
+
+def _payment_sms_text(name: str, amount: float, course_name: str, duration: str) -> str:
+    tpl = os.getenv("DLT_PAYMENT_MESSAGE", "").strip()
+    if tpl:
+        try:
+            return tpl % {
+                "name": name.strip(),
+                "amount": amount,
+                "course_name": course_name,
+                "duration": duration,
+            }
+        except Exception:
+            logger.exception("DLT_PAYMENT_MESSAGE format failed; using default body")
+    return (
+        f"ROCK MARTIAL ARTS ACADEMY: Hi {name.strip()}, your payment of ₹{amount:.0f} for "
+        f"{course_name} – {duration} was received successfully. "
+        "Thank you — see you in class!"
+    )
+
+
+def _reminder_sms_text(name: str, validity: str) -> str:
+    tpl = os.getenv("DLT_REMINDER_MESSAGE", "").strip()
+    if tpl:
+        try:
+            return tpl % {"name": name.strip(), "validity": validity}
+        except Exception:
+            logger.exception("DLT_REMINDER_MESSAGE format failed; using default body")
+    return (
+        f"ROCK MARTIAL ARTS ACADEMY: Hi {name}, your plan ends on {validity}. "
+        "Don't break your momentum—renew now and keep progressing. Stay strong!"
+    )
+
+
+def _coerce_subscription_end(val: Any) -> Optional[datetime]:
+    """Normalize end_date from Mongo (datetime, date, or ISO string) for comparisons."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, date):
+        return datetime(val.year, val.month, val.day, 23, 59, 59)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        if "T" in s:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                return dt.replace(tzinfo=None) if dt.tzinfo else dt
+            except ValueError:
+                return None
+        try:
+            d = date.fromisoformat(s[:10])
+            return datetime(d.year, d.month, d.day, 23, 59, 59)
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_end_date(s: str) -> datetime:
     s = (s or "").strip().replace("Z", "")
     if "T" in s:
@@ -172,12 +274,15 @@ class RegCheckoutController:
         if db is None:
             raise HTTPException(status_code=503, detail="Database not initialized")
 
-        norm = _normalize_phone(phone)
-        if len(norm) < 8:
+        canonical = canonical_indian_phone(phone)
+        if not canonical:
             raise HTTPException(status_code=400, detail="Invalid phone number.")
 
+        variants = otp_phone_variants(canonical)
+        filt: Dict[str, Any] = {"phone": {"$in": variants}}
+        existing = await db[COL_OTP].find_one(filt)
+
         now = datetime.utcnow()
-        existing = await db[COL_OTP].find_one({"phone": norm})
         if existing and existing.get("last_sent_at"):
             delta = (now - existing["last_sent_at"]).total_seconds()
             if delta < RESEND_COOLDOWN_SEC:
@@ -190,18 +295,19 @@ class RegCheckoutController:
         code_hash = _pwd.hash(otp)
         expires = now + timedelta(minutes=OTP_TTL_MIN)
 
-        await db[COL_OTP].update_one(
-            {"phone": norm},
-            {
-                "$set": {
-                    "phone": norm,
-                    "code_hash": code_hash,
-                    "expires_at": expires,
-                    "last_sent_at": now,
-                }
-            },
-            upsert=True,
-        )
+        otp_doc = {
+            "phone": canonical,
+            "code_hash": code_hash,
+            "expires_at": expires,
+            "last_sent_at": now,
+        }
+        if existing:
+            await db[COL_OTP].update_one(
+                {"_id": existing["_id"]},
+                {"$set": otp_doc},
+            )
+        else:
+            await db[COL_OTP].insert_one(otp_doc)
 
         msg = _otp_sms_message(otp)
         tid = _otp_dlt_template_id()
@@ -212,7 +318,7 @@ class RegCheckoutController:
                     "OTP SMS: no DLT template id (set DLT_OTP_TEMPLATE_ID). "
                     "smslogin/MSG91 often require templateid for DLT."
                 )
-        ok, sms_err = send_registration_sms(phone, msg, template_id=tid)
+        ok, sms_err = send_registration_sms(canonical, msg, template_id=tid)
         allow_stub = os.getenv("REG_CHECKOUT_ALLOW_SMS_STUB", "").lower() in (
             "1",
             "true",
@@ -220,7 +326,7 @@ class RegCheckoutController:
         )
         expects_sms = sms_provider_expects_delivery()
         if expects_sms and not allow_stub and not ok:
-            await db[COL_OTP].delete_one({"phone": norm})
+            await db[COL_OTP].delete_many({"phone": {"$in": variants}})
             hint = public_sms_failure_hint(sms_err)
             base = (
                 "Could not send OTP SMS. Set SMS_PROVIDER=smslogin, SMS_API_URL=https://smslogin.co/v3/api.php, "
@@ -245,7 +351,7 @@ class RegCheckoutController:
                 "REG_CHECKOUT_ALLOW_SMS_STUB=true only for local dev."
             )
         elif expects_sms and ok:
-            logger.info("OTP sent via SMS for phone ending ...%s", norm[-4:])
+            logger.info("OTP sent via SMS for phone ending ...%s", canonical[-4:])
 
         return {"message": "OTP sent", "expires_in_seconds": OTP_TTL_MIN * 60}
 
@@ -255,31 +361,41 @@ class RegCheckoutController:
         if db is None:
             raise HTTPException(status_code=503, detail="Database not initialized")
 
-        norm = _normalize_phone(body.phone)
-        doc = await db[COL_OTP].find_one({"phone": norm})
+        canonical = canonical_indian_phone(body.phone)
+        if not canonical:
+            raise HTTPException(status_code=400, detail="Invalid phone number.")
+        variants = otp_phone_variants(canonical)
+        doc = await db[COL_OTP].find_one({"phone": {"$in": variants}})
         if not doc:
             raise HTTPException(status_code=400, detail="No OTP request for this number.")
 
         if doc.get("expires_at") and datetime.utcnow() > doc["expires_at"]:
-            raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+            raise HTTPException(
+                status_code=400,
+                detail="OTP expired. Please resend.",
+            )
 
         if not _pwd.verify(body.otp, doc["code_hash"]):
             raise HTTPException(status_code=400, detail="Invalid OTP.")
 
-        await db[COL_OTP].delete_one({"phone": norm})
+        # Remove consumed OTP; payment flow relies on verification JWT until it expires
+        await db[COL_OTP].delete_one({"_id": doc["_id"]})
 
-        token = _issue_phone_token(norm)
+        token = _issue_phone_token(canonical)
         return {
             "verified": True,
             "verification_token": token,
-            "expires_in": 3600,
+            "expires_in": VERIFICATION_JWT_HOURS * 3600,
         }
 
     @staticmethod
     async def create_order(body: CreateRegOrderBody) -> Dict[str, Any]:
         _verify_phone_token(body.verification_token, body.phone)
+        phone_canon = canonical_indian_phone(body.phone)
+        if not phone_canon:
+            raise HTTPException(status_code=400, detail="Invalid phone number.")
 
-        client = _razorpay_client()
+        client = get_razorpay_client()
         amount_paise = int(round(float(body.amount) * 100))
         if amount_paise < 100:
             raise HTTPException(status_code=400, detail="Amount too small.")
@@ -291,14 +407,17 @@ class RegCheckoutController:
                     "currency": "INR",
                     "payment_capture": 1,
                     "notes": {
-                        "phone": _normalize_phone(body.phone),
+                        "phone": phone_canon,
                         "course": (body.course_name or "")[:120],
                     },
                 }
             )
-        except Exception as e:
+        except Exception:
             logger.exception("Razorpay order.create failed")
-            raise HTTPException(status_code=502, detail=f"Payment provider error: {str(e)}")
+            raise HTTPException(
+                status_code=502,
+                detail="We could not reach the payment service. Please try again in a moment.",
+            )
 
         db = get_db()
         if db is None:
@@ -307,7 +426,7 @@ class RegCheckoutController:
         now = datetime.utcnow()
         await db[COL_PAYMENTS].insert_one(
             {
-                "user_phone": _normalize_phone(body.phone),
+                "user_phone": phone_canon,
                 "razorpay_order_id": order["id"],
                 "razorpay_payment_id": None,
                 "razorpay_signature": None,
@@ -332,7 +451,7 @@ class RegCheckoutController:
     async def verify_payment(body: VerifyRegPaymentBody) -> Dict[str, Any]:
         _verify_phone_token(body.verification_token, body.phone)
 
-        if not _verify_razorpay_signature(
+        if not verify_razorpay_signature(
             body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
         ):
             raise HTTPException(status_code=400, detail="Invalid payment signature")
@@ -345,8 +464,10 @@ class RegCheckoutController:
         if not pay:
             raise HTTPException(status_code=404, detail="Unknown order id")
 
-        norm_phone = _normalize_phone(body.phone)
-        if pay.get("user_phone") != norm_phone:
+        norm_phone = canonical_indian_phone(body.phone)
+        if not norm_phone or not subscriber_phone_matches(
+            pay.get("user_phone"), norm_phone
+        ):
             raise HTTPException(status_code=403, detail="Phone does not match order")
 
         dup = await db[COL_SUBSCRIPTIONS].find_one({"payment_id": body.razorpay_payment_id})
@@ -366,7 +487,7 @@ class RegCheckoutController:
             },
         )
 
-        user = await db[COL_SUBSCRIBERS].find_one({"phone": norm_phone})
+        user = await db[COL_SUBSCRIBERS].find_one(subscriber_phone_lookup_filter(norm_phone))
         if not user:
             ins = await db[COL_SUBSCRIBERS].insert_one(
                 {
@@ -381,7 +502,13 @@ class RegCheckoutController:
             user_id = user["_id"]
             await db[COL_SUBSCRIBERS].update_one(
                 {"_id": user_id},
-                {"$set": {"name": body.name.strip(), "is_verified": True}},
+                {
+                    "$set": {
+                        "name": body.name.strip(),
+                        "is_verified": True,
+                        "phone": norm_phone,
+                    }
+                },
             )
 
         end_dt = _parse_end_date(body.end_date)
@@ -398,35 +525,41 @@ class RegCheckoutController:
             }
         )
 
-        welcome = (
-            f"ROCK MARTIAL ARTS ACADEMY: Welcome {body.name}! Your registration for "
-            f"{body.course_name} – {body.duration} is confirmed. Get ready to train hard and grow stronger every day. See you in class!"
+        pay_msg = _payment_sms_text(
+            body.name, float(body.amount), body.course_name, body.duration
         )
-        tid_w = _dlt_template_id_primary_legacy(
-            "DLT_WELCOME_TEMPLATE_ID", "DLT_TEMPLATE_WELCOME"
-        )
-        if not send_registration_sms(body.phone, welcome, template_id=tid_w)[0]:
-            logger.warning(
-                "Welcome SMS failed for payment_id=%s phone=...%s",
-                body.razorpay_payment_id,
-                _normalize_phone(body.phone)[-4:],
-            )
+        tid_pay = _sms_dlt_template_id("payment")
+        welcome = _welcome_sms_text(body.name, body.course_name, body.duration)
+        tid_w = _sms_dlt_template_id("welcome")
 
-        tid_pay = _dlt_template_id_primary_legacy(
-            "DLT_PAYMENT_TEMPLATE_ID", "DLT_TEMPLATE_PAYMENT_CONFIRMED"
-        )
-        if tid_pay:
-            amt = float(body.amount)
-            pay_msg = (
-                f"ROCK MARTIAL ARTS ACADEMY: Hi {body.name.strip()}, your payment of ₹{amt:.0f} for "
-                f"{body.course_name} – {body.duration} was received successfully. "
-                "Thank you — see you in class!"
-            )
-            if not send_registration_sms(body.phone, pay_msg, template_id=tid_pay)[0]:
-                logger.warning(
-                    "Payment confirmation SMS failed for payment_id=%s",
+        welcome_also_in_payment = False
+        if tid_w:
+            ok_w, err_w = send_registration_sms(norm_phone, welcome, template_id=tid_w)
+            if not ok_w:
+                logger.error(
+                    "Welcome SMS failed payment_id=%s phone=...%s err=%s — will include welcome in payment SMS.",
                     body.razorpay_payment_id,
+                    (norm_phone or body.phone)[-4:],
+                    err_w,
                 )
+                welcome_also_in_payment = True
+        else:
+            logger.warning(
+                "DLT_WELCOME_TEMPLATE_ID not set — prepending welcome text to payment SMS "
+                "so the student still receives a welcome line (single DLT template)."
+            )
+            welcome_also_in_payment = True
+        if welcome_also_in_payment:
+            pay_msg = f"{welcome.strip()} {pay_msg.strip()}"
+
+        ok_p, err_p = send_registration_sms(norm_phone, pay_msg, template_id=tid_pay)
+        if not ok_p:
+            logger.error(
+                "Payment confirmation SMS failed payment_id=%s phone=...%s err=%s",
+                body.razorpay_payment_id,
+                (norm_phone or body.phone)[-4:],
+                err_p,
+            )
 
         return {
             "status": "success",
@@ -448,36 +581,55 @@ class RegCheckoutController:
         until = now + timedelta(days=7)
         q = {
             "status": "active",
-            "end_date": {"$gte": now, "$lte": until},
             "$or": [{"renewal_reminder_sent": {"$exists": False}}, {"renewal_reminder_sent": False}],
         }
 
         sent = 0
+        skipped = 0
         async for sub in db[COL_SUBSCRIPTIONS].find(q):
+            end = _coerce_subscription_end(sub.get("end_date"))
+            if end is None:
+                skipped += 1
+                continue
+            if end < now or end > until:
+                continue
+
             user = await db[COL_SUBSCRIBERS].find_one({"_id": sub["user_id"]})
             if not user:
+                skipped += 1
                 continue
             phone = user.get("phone")
-            name = user.get("name", "Student")
-            end = sub.get("end_date")
-            if isinstance(end, datetime):
-                validity = end.strftime("%d-%m-%Y")
-            else:
-                validity = str(end)
+            if not phone:
+                skipped += 1
+                continue
+            name = str(user.get("name") or "Student").strip() or "Student"
+            validity = end.strftime("%d-%m-%Y")
 
-            msg = (
-                f"ROCK MARTIAL ARTS ACADEMY: Hi {name}, your plan ends on {validity}. "
-                "Don't break your momentum—renew now and keep progressing. Stay strong!"
-            )
-            tid = _dlt_template_id_primary_legacy(
-                "DLT_REMINDER_TEMPLATE_ID", "DLT_TEMPLATE_REMINDER"
-            )
-            ok, _ = send_registration_sms(phone, msg, template_id=tid)
+            msg = _reminder_sms_text(name, validity)
+            tid = _sms_dlt_template_id("reminder")
+            ok, err = send_registration_sms(phone, msg, template_id=tid)
             if ok:
                 await db[COL_SUBSCRIPTIONS].update_one(
                     {"_id": sub["_id"]},
                     {"$set": {"renewal_reminder_sent": True, "renewal_reminder_at": now}},
                 )
                 sent += 1
+                logger.info(
+                    "Renewal reminder SMS sent subscription_id=%s phone=...%s",
+                    sub.get("_id"),
+                    (canonical_indian_phone(str(phone)) or str(phone))[-4:],
+                )
+            else:
+                cu = canonical_indian_phone(str(phone)) or str(phone)
+                logger.error(
+                    "Renewal reminder SMS failed subscription_id=%s phone=...%s err=%s",
+                    sub.get("_id"),
+                    cu[-4:] if len(cu) >= 4 else cu,
+                    err,
+                )
 
-        return {"message": "Renewal reminders processed", "sent": sent}
+        return {
+            "message": "Renewal reminders processed",
+            "sent": sent,
+            "skipped_no_user_or_end_date": skipped,
+        }

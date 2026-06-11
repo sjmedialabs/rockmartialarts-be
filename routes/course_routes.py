@@ -5,7 +5,7 @@ from controllers.payment_controller import PaymentController
 from models.course_models import CourseCreate, CourseUpdate
 from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
-from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
+from utils.unified_auth import require_role_unified, get_current_user_or_superadmin, get_optional_current_user_or_superadmin
 
 router = APIRouter()
 
@@ -75,10 +75,18 @@ async def get_course_payment_info(
         None,
         description="Branch batch id or __index:n__ from public by-branch course list",
     ),
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin),
 ):
-    """Get payment information for a course (public endpoint for registration)"""
+    """Get payment information for a course. Optional Bearer token: students see totals without repeat admission fee."""
+    optional_student_id = None
+    if current_user and current_user.get("role") == "student":
+        optional_student_id = current_user.get("id")
     return await PaymentController.get_course_payment_info(
-        course_id, branch_id, duration, batch_ref=batch_ref
+        course_id,
+        branch_id,
+        duration,
+        batch_ref=batch_ref,
+        optional_student_id=optional_student_id,
     )
 
 @router.get("/public/all")

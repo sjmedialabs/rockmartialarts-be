@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 import uuid
 from enum import Enum
 
@@ -87,3 +87,10 @@ class RegistrationPaymentResponse(BaseModel):
     amount: float
     status: PaymentStatus
     message: str
+
+
+class AdminPaymentRecoveryBody(BaseModel):
+    """Recover an admin-cancelled payment row and linked enrollment."""
+
+    action: Literal["restore_checkout", "mark_received", "waive"]
+    note: Optional[str] = None

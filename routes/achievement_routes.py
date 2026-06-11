@@ -44,11 +44,20 @@ async def get_student_achievements(
     return await AchievementController.get_by_student(student_id, current_user)
 
 
+@router.get("/public/global")
+async def get_global_achievements_public(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(6, ge=1, le=50),
+):
+    """Public: get most recent achievements across all branches (for homepage). No auth."""
+    return await AchievementController.get_global_public(skip=skip, limit=limit)
+
+
 @router.get("/public/branch/{branch_id}")
 async def get_branch_achievements_public(
     branch_id: str,
   skip: int = Query(0, ge=0),
-  limit: int = Query(12, ge=1, le=50),
+  limit: int = Query(50, ge=1, le=200),
 ):
     """Public: get achievements for a branch (for branch detail page). No auth."""
     return await AchievementController.get_by_branch_public(branch_id, skip=skip, limit=limit)

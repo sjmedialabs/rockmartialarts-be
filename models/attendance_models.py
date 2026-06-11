@@ -24,6 +24,11 @@ class Attendance(BaseModel):
     status: Optional[str] = None  # Store the original status (present, absent, late)
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime] = None
+    # Set when an admin updates an existing same-day record (manual time edits / corrections)
+    admin_adjusted: bool = False
+    attendance_modified_at: Optional[datetime] = None
+    attendance_modified_by: Optional[str] = None
 
 class AttendanceCreate(BaseModel):
     student_id: str

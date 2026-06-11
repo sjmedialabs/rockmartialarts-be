@@ -16,8 +16,8 @@ from utils.auth import hash_password, verify_password, BCRYPT_MAX_PASSWORD_BYTES
 ROOT_DIR = Path(__file__).parent.parent
 load_dotenv(ROOT_DIR / '.env')
 
-# JWT settings
-SECRET_KEY = os.getenv("SECRET_KEY", "student_management_secret_key_2025")
+# JWT settings — MUST match utils/unified_auth.py and utils/auth.py or all protected routes return 401
+SECRET_KEY = os.getenv("SECRET_KEY", "student_management_secret_key_2025_secure")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 

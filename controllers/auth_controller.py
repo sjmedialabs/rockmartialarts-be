@@ -1,21 +1,144 @@
-from fastapi import HTTPException, Depends, status, Request
-from typing import Optional
+from fastapi import HTTPException, Depends, status, Request, UploadFile
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import secrets
 import jwt
 import os
 import logging
+import random
 import re
+import string
 import uuid
 
-from models.user_models import UserCreate, UserLogin, ForgotPassword, ResetPassword, UserUpdate, BaseUser, UserRole, StudentProfileUpdate, StudentProfileResponse, StudentAddress, StudentEmergencyContact, StudentMedicalInfo
+from passlib.context import CryptContext
+
+from models.user_models import (
+    UserCreate,
+    UserLogin,
+    ForgotPassword,
+    ResetPassword,
+    UserUpdate,
+    BaseUser,
+    UserRole,
+    StudentProfileUpdate,
+    StudentProfileResponse,
+    StudentAddress,
+    StudentEmergencyContact,
+    StudentMedicalInfo,
+)
 from utils.auth import hash_password, verify_password, create_access_token, get_current_active_user, SECRET_KEY, ALGORITHM
 from utils.database import get_db
 from utils.helpers import serialize_doc, log_activity, send_sms
 from utils.email_service import send_password_reset_email, send_password_reset_email_webhook
 from utils.enrollment_dates import resolve_enrollment_end_date
+from utils.indian_phone import canonical_indian_phone, otp_phone_variants
+from utils.subscription_dates import is_subscription_period_over
+from utils.reg_checkout_sms import (
+    public_sms_failure_hint,
+    send_registration_sms,
+    sms_provider_expects_delivery,
+)
 
 logger = logging.getLogger(__name__)
+
+COL_PASSWORD_RESET_OTP = "auth_password_reset_otp"
+PASSWORD_RESET_OTP_TTL_MIN = max(1, min(15, int(os.getenv("PASSWORD_RESET_OTP_TTL_MIN", "5"))))
+PASSWORD_RESET_RESEND_SEC = int(os.getenv("PASSWORD_RESET_RESEND_COOLDOWN_SEC", "30"))
+PASSWORD_RESET_MAX_OTP_ATTEMPTS = max(3, min(10, int(os.getenv("PASSWORD_RESET_OTP_MAX_ATTEMPTS", "5"))))
+_pwd_otp_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _normalize_payment_state(payment_doc: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Normalize payment state from mixed legacy fields (`payment_status` or raw `status`)."""
+    if not payment_doc:
+        return None
+    ps = str(payment_doc.get("payment_status") or "").strip().lower()
+    if ps:
+        return ps
+    raw = str(payment_doc.get("status") or "").strip().lower()
+    if raw in {"success", "captured", "paid", "completed"}:
+        return "paid"
+    if raw in {"authorized", "processing"}:
+        return "processing"
+    if raw in {"initiated", "created", "pending"}:
+        return "pending"
+    if raw in {"failed", "error"}:
+        return "failed"
+    if raw in {"cancelled", "canceled", "refunded"}:
+        return "cancelled"
+    return None
+
+
+def _derive_enrollment_status_row(enrollment: Dict[str, Any], payment_status: str) -> str:
+    """Consistent UI status for student profile/dashboard consumers."""
+    explicit = str(enrollment.get("status") or "").strip().lower()
+    if explicit in {"cancelled", "canceled"}:
+        return "cancelled"
+    if explicit == "paused":
+        return "paused"
+    if payment_status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if payment_status == "paused":
+        return "paused"
+    if is_subscription_period_over(enrollment.get("end_date")):
+        return "expired"
+    if not bool(enrollment.get("is_active", True)):
+        return "inactive"
+    return "active"
+
+
+def _student_phone_match_variants(canonical: str) -> List[str]:
+    """All phone string variants that may appear on student `users.phone` documents."""
+    national = canonical[3:] if canonical.startswith("+91") and len(canonical) == 13 else ""
+    if len(national) != 10:
+        c2 = canonical_indian_phone(canonical)
+        national = c2[3:] if c2 else ""
+    if len(national) != 10:
+        return [canonical]
+    ordered = [
+        canonical,
+        national,
+        f"91{national}",
+        f"+91{national}",
+        f"+91-{national}",
+        f"+91 {national}",
+        f"0{national}",
+        f"91-{national}",
+    ]
+    seen: Dict[str, None] = {}
+    for x in ordered:
+        if x:
+            seen.setdefault(x, None)
+    return list(seen.keys())
+
+
+async def _find_student_user_by_canonical_phone(db, canonical: str) -> Optional[Dict[str, Any]]:
+    variants = _student_phone_match_variants(canonical)
+    return await db.users.find_one({"role": UserRole.STUDENT.value, "phone": {"$in": variants}})
+
+
+def _pw_reset_otp_dlt_template_id() -> Optional[str]:
+    tid = os.getenv("PASSWORD_RESET_DLT_OTP_TEMPLATE_ID", "").strip()
+    if tid:
+        return tid
+    return (os.getenv("DLT_OTP_TEMPLATE_ID", "").strip() or os.getenv("SMS_OTP_TEMPLATE_ID", "").strip() or None)
+
+
+def _pw_reset_otp_sms_body(otp: str) -> str:
+    body = os.getenv("PASSWORD_RESET_OTP_MESSAGE", "").strip()
+    if not body:
+        body = os.getenv("DLT_OTP_MESSAGE", "").strip()
+    if body:
+        if "%s" in body:
+            try:
+                return body % otp
+            except Exception:
+                logger.exception("PASSWORD_RESET_OTP_MESSAGE / DLT_OTP_MESSAGE %%s formatting failed")
+        return body.replace("{otp}", otp).replace("{OTP}", otp)
+    return (
+        "ROCK MARTIAL ARTS ACADEMY: Your password reset OTP is "
+        f"{otp}. Valid for {PASSWORD_RESET_OTP_TTL_MIN} minutes. Do not share this code."
+    )
 
 
 class AuthController:
@@ -50,7 +173,6 @@ class AuthController:
             "last_name": user_data.last_name,
             "full_name": full_name,
             "role": user_data.role.value,  # Convert enum to string
-            "biometric_id": user_data.biometric_id,
             "is_active": True,
             # Self-service registration: student already has login credentials
             "has_credentials": True,
@@ -64,6 +186,19 @@ class AuthController:
         # Set branch_id for staff members
         if user_data.branch_id:
             user_dict["branch_id"] = user_data.branch_id
+
+        # Biometric / ESSL mapping: omit keys when unset — unique sparse indexes still index BSON null.
+        if user_data.biometric_id:
+            b = str(user_data.biometric_id).strip()
+            if b:
+                user_dict["biometric_id"] = b
+                user_dict["essl_user_id"] = b
+        if getattr(user_data, "essl_user_id", None):
+            v = str(user_data.essl_user_id).strip()
+            if v:
+                user_dict["essl_user_id"] = v
+                if not user_dict.get("biometric_id"):
+                    user_dict["biometric_id"] = v
 
         # BACKWARD COMPATIBILITY: Store course and branch data in user document
         # This ensures existing frontend integrations continue to work
@@ -87,6 +222,8 @@ class AuthController:
             user_dict["address"] = user_data.address
         if getattr(user_data, "emergency_contact", None) is not None:
             user_dict["emergency_contact"] = user_data.emergency_contact
+        if user_data.role == UserRole.STUDENT and user_data.student_level:
+            user_dict["student_level"] = user_data.student_level
 
         result = await db.users.insert_one(user_dict)
 
@@ -183,7 +320,6 @@ class AuthController:
             "last_name": user_data.last_name,
             "full_name": full_name,
             "role": user_data.role.value,
-            "biometric_id": user_data.biometric_id,
             "is_active": True,
             # Bulk / silent admin provisioning: invite onboarding until they complete the link
             "has_credentials": False,
@@ -193,6 +329,17 @@ class AuthController:
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        if user_data.biometric_id:
+            b = str(user_data.biometric_id).strip()
+            if b:
+                user_dict["biometric_id"] = b
+                user_dict["essl_user_id"] = b
+        if getattr(user_data, "essl_user_id", None):
+            v = str(user_data.essl_user_id).strip()
+            if v:
+                user_dict["essl_user_id"] = v
+                if not user_dict.get("biometric_id"):
+                    user_dict["biometric_id"] = v
         if user_data.branch_id:
             user_dict["branch_id"] = user_data.branch_id
         if user_data.course:
@@ -304,6 +451,7 @@ class AuthController:
                 branch_id = user["branch"].get("branch_id")
 
             logger.info("POST /api/auth/login: success user_id=%s", user.get("id"))
+            profile_img = user.get("profile_image") or user.get("profile_photo") or user.get("photo")
             return {"access_token": access_token, "token_type": "bearer", "expires_in": 86400, "user": {
                 "id": user["id"],
                 "email": user["email"],
@@ -315,7 +463,8 @@ class AuthController:
                 "gender": user.get("gender"),
                 "branch_id": branch_id,
                 "course": user.get("course"),
-                "branch": user.get("branch")
+                "branch": user.get("branch"),
+                "profile_image": profile_img,
             }}
         except HTTPException:
             raise
@@ -403,6 +552,121 @@ class AuthController:
         return {"message": "Password has been reset successfully."}
 
     @staticmethod
+    async def password_reset_send_otp(raw_phone: str) -> Dict[str, Any]:
+        """Send OTP via SMS for student password reset (registered mobile only)."""
+        db = get_db()
+        canonical = canonical_indian_phone(raw_phone)
+        if not canonical:
+            raise HTTPException(status_code=400, detail="Invalid mobile number format.")
+
+        user = await _find_student_user_by_canonical_phone(db, canonical)
+        if not user:
+            raise HTTPException(status_code=404, detail="Mobile number not found")
+
+        now = datetime.utcnow()
+        variants = otp_phone_variants(canonical)
+        filt: Dict[str, Any] = {"phone": {"$in": variants}}
+        existing = await db[COL_PASSWORD_RESET_OTP].find_one(filt)
+
+        if existing and existing.get("last_sent_at"):
+            delta = (now - existing["last_sent_at"]).total_seconds()
+            if delta < PASSWORD_RESET_RESEND_SEC:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Please wait {int(PASSWORD_RESET_RESEND_SEC - delta)}s before resending OTP.",
+                )
+
+        otp = "".join(random.choices(string.digits, k=6))
+        code_hash = _pwd_otp_ctx.hash(otp)
+        expires = now + timedelta(minutes=PASSWORD_RESET_OTP_TTL_MIN)
+        otp_doc = {
+            "phone": canonical,
+            "code_hash": code_hash,
+            "expires_at": expires,
+            "last_sent_at": now,
+            "failed_attempts": 0,
+            "user_id": user["id"],
+        }
+        if existing:
+            await db[COL_PASSWORD_RESET_OTP].update_one(
+                {"_id": existing["_id"]},
+                {"$set": otp_doc},
+            )
+        else:
+            await db[COL_PASSWORD_RESET_OTP].insert_one(otp_doc)
+
+        msg = _pw_reset_otp_sms_body(otp)
+        tid = _pw_reset_otp_dlt_template_id()
+        ok, sms_err = send_registration_sms(canonical, msg, template_id=tid)
+        allow_stub = os.getenv("PASSWORD_RESET_ALLOW_SMS_STUB", "").lower() in ("1", "true", "yes")
+        expects_sms = sms_provider_expects_delivery()
+
+        if expects_sms and not allow_stub and not ok:
+            await db[COL_PASSWORD_RESET_OTP].delete_many(filt)
+            hint = public_sms_failure_hint(sms_err)
+            detail = (
+                "Could not send OTP SMS. Check SMS gateway configuration (same as registration OTP)."
+            )
+            if hint:
+                detail = f"{detail} {hint}"
+            raise HTTPException(status_code=503, detail=detail)
+        if expects_sms and allow_stub and not ok:
+            logger.warning(
+                "Password reset OTP SMS failed; PASSWORD_RESET_ALLOW_SMS_STUB=true — OTP still stored."
+            )
+
+        return {
+            "message": "OTP sent to your registered mobile number",
+            "expires_in_seconds": PASSWORD_RESET_OTP_TTL_MIN * 60,
+        }
+
+    @staticmethod
+    async def password_reset_verify_otp(raw_phone: str, otp: str) -> Dict[str, Any]:
+        """Validate OTP and return a short-lived JWT accepted by POST /auth/reset-password."""
+        db = get_db()
+        canonical = canonical_indian_phone(raw_phone)
+        if not canonical:
+            raise HTTPException(status_code=400, detail="Invalid mobile number format.")
+
+        variants = otp_phone_variants(canonical)
+        doc = await db[COL_PASSWORD_RESET_OTP].find_one({"phone": {"$in": variants}})
+        if not doc:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        if doc.get("expires_at") and datetime.utcnow() > doc["expires_at"]:
+            await db[COL_PASSWORD_RESET_OTP].delete_one({"_id": doc["_id"]})
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        if not _pwd_otp_ctx.verify(otp, doc["code_hash"]):
+            await db[COL_PASSWORD_RESET_OTP].update_one(
+                {"_id": doc["_id"]},
+                {"$inc": {"failed_attempts": 1}},
+            )
+            fresh = await db[COL_PASSWORD_RESET_OTP].find_one({"_id": doc["_id"]})
+            attempts = int(fresh.get("failed_attempts") or 0) if fresh else PASSWORD_RESET_MAX_OTP_ATTEMPTS
+            if attempts >= PASSWORD_RESET_MAX_OTP_ATTEMPTS:
+                await db[COL_PASSWORD_RESET_OTP].delete_one({"_id": doc["_id"]})
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        user_id = doc.get("user_id")
+        if not user_id:
+            await db[COL_PASSWORD_RESET_OTP].delete_one({"_id": doc["_id"]})
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        user = await db.users.find_one({"id": user_id, "role": UserRole.STUDENT.value})
+        if not user:
+            await db[COL_PASSWORD_RESET_OTP].delete_one({"_id": doc["_id"]})
+            raise HTTPException(status_code=404, detail="Mobile number not found")
+
+        await db[COL_PASSWORD_RESET_OTP].delete_one({"_id": doc["_id"]})
+
+        reset_token = create_access_token(
+            data={"sub": user_id, "scope": "password_reset"},
+            expires_delta=timedelta(minutes=15),
+        )
+        return {"reset_token": reset_token, "expires_in": 15 * 60}
+
+    @staticmethod
     async def get_current_user_info(current_user: dict = Depends(get_current_active_user)):
         """Get current user information"""
         user_info = current_user.copy()
@@ -414,7 +678,16 @@ class AuthController:
     @staticmethod
     async def update_profile(user_update: UserUpdate, current_user: dict = Depends(get_current_active_user)):
         """Update user profile"""
-        update_data = {k: v for k, v in user_update.dict().items() if v is not None}
+        update_data = {}
+        for k, v in user_update.dict().items():
+            if v is None:
+                continue
+            if k in ("biometric_id", "essl_user_id"):
+                if isinstance(v, str) and not v.strip():
+                    continue
+                update_data[k] = v.strip() if isinstance(v, str) else v
+            else:
+                update_data[k] = v
 
         # Auto-generate full_name if first_name or last_name is being updated
         if user_update.first_name is not None or user_update.last_name is not None:
@@ -535,6 +808,51 @@ class AuthController:
             course = await db.courses.find_one({"id": enrollment["course_id"]})
             # Get branch details
             branch = await db.branches.find_one({"id": enrollment["branch_id"]})
+            raw_payment_status = str(enrollment.get("payment_status", "pending")).lower()
+            effective_payment_status = raw_payment_status
+            latest_payment = await db.payments.find_one(
+                {
+                    "student_id": current_user["id"],
+                    "enrollment_id": enrollment.get("id"),
+                },
+                sort=[("created_at", -1)],
+            )
+            normalized_latest_payment_state = _normalize_payment_state(latest_payment)
+            if normalized_latest_payment_state:
+                effective_payment_status = normalized_latest_payment_state
+            elif raw_payment_status != "paid":
+                paid_payment = await db.payments.find_one(
+                    {
+                        "student_id": current_user["id"],
+                        "enrollment_id": enrollment.get("id"),
+                        "$or": [
+                            {"payment_status": "paid"},
+                            {"status": {"$in": ["success", "captured", "paid", "completed"]}},
+                        ],
+                    },
+                    {"id": 1},
+                )
+                if paid_payment:
+                    effective_payment_status = "paid"
+
+            if effective_payment_status != raw_payment_status:
+                # Heal stale enrollment status so all screens stay consistent.
+                await db.enrollments.update_one(
+                    {"id": enrollment.get("id")},
+                    {"$set": {"payment_status": effective_payment_status, "updated_at": datetime.utcnow()}},
+                )
+
+            duration_id = enrollment.get("duration_id")
+            duration_months = None
+            if duration_id:
+                try:
+                    dur_row = await db.durations.find_one({"id": duration_id})
+                    if not dur_row:
+                        dur_row = await db.durations.find_one({"code": duration_id})
+                    if dur_row and dur_row.get("duration_months") is not None:
+                        duration_months = int(dur_row["duration_months"])
+                except (TypeError, ValueError):
+                    duration_months = None
 
             enriched_enrollment = {
                 "id": enrollment["id"],
@@ -545,16 +863,21 @@ class AuthController:
                 "enrollment_date": enrollment.get("enrollment_date"),
                 "start_date": enrollment.get("start_date"),
                 "end_date": enrollment.get("end_date"),
-                "payment_status": enrollment.get("payment_status", "pending"),
-                "is_active": enrollment.get("is_active", True)
+                "payment_status": effective_payment_status,
+                "status": _derive_enrollment_status_row(enrollment, effective_payment_status),
+                "is_active": enrollment.get("is_active", True),
+                "duration_id": duration_id,
+                "duration_months": duration_months,
+                "fee_amount": enrollment.get("fee_amount"),
+                "admission_fee": enrollment.get("admission_fee"),
             }
             enriched_enrollments.append(enriched_enrollment)
 
-            # Track latest end_date for subscription expiry
+            # Subscription banner: max end_date among paid rows only (skip cancelled/pending far-future noise)
+            ep = str(effective_payment_status or "").lower()
             end_date = enrollment.get("end_date")
-            if end_date:
+            if ep == "paid" and end_date:
                 try:
-                    # end_date may already be a datetime; if not, attempt to parse via ISO format
                     if isinstance(end_date, str):
                         parsed = datetime.fromisoformat(end_date.replace("Z", "+00:00")) if "T" in end_date else datetime.fromisoformat(end_date)
                     else:
@@ -562,10 +885,10 @@ class AuthController:
                     if latest_end_date is None or parsed > latest_end_date:
                         latest_end_date = parsed
                 except Exception:
-                    # If parsing fails, skip this record
                     pass
 
         # Prepare profile response
+        profile_img = user.get("profile_image") or user.get("profile_photo") or user.get("photo")
         profile_data = {
             "id": user["id"],
             "email": user["email"],
@@ -575,6 +898,8 @@ class AuthController:
             "full_name": user["full_name"],
             "date_of_birth": user.get("date_of_birth"),
             "gender": user.get("gender"),
+            "current_belt": user.get("current_belt") or user.get("belt_rank"),
+            "profile_image": profile_img,
             "address": user.get("address"),
             "emergency_contact": user.get("emergency_contact"),
             "medical_info": user.get("medical_info"),
@@ -653,3 +978,65 @@ class AuthController:
         )
 
         return {"message": "Profile updated successfully"}
+
+    MAX_PROFILE_PHOTO_BYTES = 2 * 1024 * 1024  # ~2MB
+    PROFILE_PHOTO_TYPES = {"image/jpeg", "image/png"}
+
+    @staticmethod
+    async def upload_student_profile_photo(file: UploadFile, current_user: dict):
+        """Save student profile photo (JPEG/PNG, max ~2MB); returns public path under /uploads/images/."""
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can upload a profile photo")
+
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        if content_type not in AuthController.PROFILE_PHOTO_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Use JPG or PNG.",
+            )
+
+        data = await file.read()
+        if len(data) > AuthController.MAX_PROFILE_PHOTO_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum size is {AuthController.MAX_PROFILE_PHOTO_BYTES // (1024 * 1024)} MB.",
+            )
+
+        from controllers.upload_controller import UPLOAD_ROOT, _safe_filename
+
+        dest_dir = UPLOAD_ROOT / "images"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        filename = file.filename or "photo.jpg"
+        safe_name = _safe_filename(filename)
+        ext = safe_name.lower().rsplit(".", 1)[-1] if "." in safe_name else ""
+        if ext not in ("jpg", "jpeg", "png"):
+            safe_name = f"{safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name}.jpg"
+
+        dest_path = dest_dir / safe_name
+        dest_path.write_bytes(data)
+        file_url = f"/uploads/images/{safe_name}"
+
+        db = get_db()
+        now = datetime.utcnow()
+        result = await db.users.update_one(
+            {"id": current_user["id"]},
+            {"$set": {"profile_image": file_url, "updated_at": now}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        try:
+            await log_activity(
+                request=None,
+                action="student_profile_photo_update",
+                user_id=current_user["id"],
+                user_name=current_user.get("full_name", "Student"),
+                details={"profile_image": file_url},
+            )
+        except Exception:
+            pass
+
+        return {
+            "message": "Profile photo updated successfully",
+            "profile_image": file_url,
+        }

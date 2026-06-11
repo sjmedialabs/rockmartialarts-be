@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, Query
 from controllers.branch_controller import BranchController
 from models.branch_models import BranchCreate, BranchUpdate
 from models.holiday_models import HolidayCreate
@@ -20,9 +20,10 @@ async def create_branch(
 async def get_branches(
     skip: int = 0,
     limit: int = 50,
+    active_only: bool = Query(True, description="When false, include disabled branches (admin list)"),
     current_user: dict = Depends(get_current_user_or_superadmin)
 ):
-    return await BranchController.get_branches(skip, limit, current_user)
+    return await BranchController.get_branches(skip, limit, active_only, current_user)
 
 @router.get("/{branch_id}")
 async def get_branch(

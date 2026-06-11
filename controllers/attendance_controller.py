@@ -1,9 +1,53 @@
 from fastapi import HTTPException, Depends
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, date as date_cls
+from zoneinfo import ZoneInfo
+import logging
 import uuid
 import csv
 import io
+
+logger = logging.getLogger(__name__)
+COL_ATTENDANCE_AUDIT = "attendance_audit"
+
+# Naive datetimes from Mongo are stored as UTC; display clock times in IST for Indian academy.
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _attendance_calendar_day(value) -> Optional[str]:
+    """Normalize Mongo attendance_date (datetime, date, or ISO string) to YYYY-MM-DD."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date_cls):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        return s[:10] if len(s) >= 10 else s
+    return None
+
+
+def _dt_to_ist_ampm(dt: Optional[datetime]) -> Optional[str]:
+    """Format a stored instant as hh:mm AM/PM in Asia/Kolkata (IST)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    s = dt.astimezone(_IST).strftime("%I:%M %p").strip()
+    return s.upper()
+
+
+def _validate_check_in_out_order(
+    check_in: Optional[datetime], check_out: Optional[datetime]
+) -> None:
+    if check_in is not None and check_out is not None and check_out <= check_in:
+        raise HTTPException(
+            status_code=400,
+            detail="Check-out time must be after check-in time.",
+        )
 
 from models.attendance_models import (
     AttendanceCreate, BiometricAttendance, Attendance, AttendanceMethod,
@@ -112,7 +156,11 @@ class AttendanceController:
                         "is_present": 1,
                         "method": 1,
                         "notes": 1,
-                        "created_at": 1
+                        "created_at": 1,
+                        "admin_adjusted": 1,
+                        "attendance_modified_at": 1,
+                        "attendance_modified_by": 1,
+                        "updated_at": 1,
                     }
                 },
                 {"$sort": {"attendance_date": -1}}
@@ -212,13 +260,24 @@ class AttendanceController:
                     enrollment_filter["branch_id"] = {"$in": managed_branch_ids}
                 elif branch_id:
                     enrollment_filter["branch_id"] = branch_id
+                # Only apply course filtering when explicitly requested
+                if course_id:
+                    enrollment_filter["course_id"] = course_id
 
                 # Get matching enrollments
+                # For superadmin without any branch/course filter, show all students even if
+                # enrollments collection is incomplete (prevents "empty attendance" UI).
+                user_role = str(current_user.get("role") or "").lower() if current_user else ""
+                must_filter_by_enrollment = bool(managed_branch_ids or branch_id or course_id)
+                # Always load enrollments for course context (but don't always filter student list by them).
                 enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
-
-                # Filter students based on enrollment matches
-                enrolled_student_ids = set(enrollment["student_id"] for enrollment in enrollments)
-                students = [student for student in students if student["id"] in enrolled_student_ids]
+                if must_filter_by_enrollment or user_role in ["branch_manager", "coach", "coach_admin"]:
+                    enrolled_student_ids = set(
+                        enrollment.get("student_id")
+                        for enrollment in enrollments
+                        if enrollment.get("student_id")
+                    )
+                    students = [student for student in students if student.get("id") in enrolled_student_ids]
 
                 # Get attendance records for the specific date
                 attendance_records = await db.attendance.find(filter_query).to_list(length=None)
@@ -241,10 +300,26 @@ class AttendanceController:
                             "check_in_time": record.get("check_in_time"),
                             "check_out_time": record.get("check_out_time"),
                             "notes": record.get("notes", ""),
-                            "marked_by": record.get("marked_by")
+                            "marked_by": record.get("marked_by"),
+                            "admin_adjusted": record.get("admin_adjusted", False),
+                            "attendance_modified_at": record.get("attendance_modified_at"),
+                            "attendance_modified_by": record.get("attendance_modified_by"),
                         }
 
                 # Combine student data with attendance and course information
+                # Prefetch courses referenced by the enrollments for this result set.
+                course_ids = list(
+                    {
+                        e.get("course_id")
+                        for e in enrollments
+                        if e.get("course_id")
+                    }
+                )
+                course_docs = []
+                if course_ids:
+                    course_docs = await db.courses.find({"id": {"$in": course_ids}}).to_list(length=None)
+                course_by_id = {c.get("id"): c for c in course_docs if c.get("id")}
+
                 result_students = []
                 for student in students:
                     student_id = student.get("id")
@@ -253,16 +328,19 @@ class AttendanceController:
                         "check_in_time": None,
                         "check_out_time": None,
                         "notes": "",
-                        "marked_by": None
+                        "marked_by": None,
+                        "admin_adjusted": False,
+                        "attendance_modified_at": None,
+                        "attendance_modified_by": None,
                     })
 
                     # Get student's enrollments for course information
-                    student_enrollments = [e for e in enrollments if e["student_id"] == student_id]
+                    student_enrollments = [e for e in enrollments if e.get("student_id") == student_id]
                     courses = []
 
                     for enrollment in student_enrollments:
                         # Get course details
-                        course = await db.courses.find_one({"id": enrollment["course_id"]})
+                        course = course_by_id.get(enrollment.get("course_id"))
                         if course:
                             courses.append({
                                 "id": course["id"],
@@ -1178,7 +1256,10 @@ class AttendanceController:
                         "check_in_time": record.get("check_in_time"),
                         "check_out_time": record.get("check_out_time"),
                         "notes": record.get("notes", ""),
-                        "marked_by": record.get("marked_by")
+                        "marked_by": record.get("marked_by"),
+                        "admin_adjusted": record.get("admin_adjusted", False),
+                        "attendance_modified_at": record.get("attendance_modified_at"),
+                        "attendance_modified_by": record.get("attendance_modified_by"),
                     }
 
             # Combine student data with attendance and course information
@@ -1190,7 +1271,10 @@ class AttendanceController:
                     "check_in_time": None,
                     "check_out_time": None,
                     "notes": "",
-                    "marked_by": None
+                    "marked_by": None,
+                    "admin_adjusted": False,
+                    "attendance_modified_at": None,
+                    "attendance_modified_by": None,
                 })
 
                 # Get student's enrollments for course information
@@ -1320,16 +1404,23 @@ class AttendanceController:
                     "check_in_time": None,
                     "check_out_time": None,
                     "notes": "",
-                    "marked_by": None
+                    "marked_by": None,
+                    "admin_adjusted": False,
+                    "attendance_modified_at": None,
+                    "attendance_modified_by": None,
                 }
 
                 if attendance_record:
+                    mod_at = attendance_record.get("attendance_modified_at") or attendance_record.get("updated_at")
                     attendance_data = {
                         "status": attendance_record.get("status", "present" if attendance_record.get("is_present") else "absent"),
                         "check_in_time": attendance_record.get("check_in_time").isoformat() if attendance_record.get("check_in_time") else None,
                         "check_out_time": attendance_record.get("check_out_time").isoformat() if attendance_record.get("check_out_time") else None,
                         "notes": attendance_record.get("notes", ""),
-                        "marked_by": attendance_record.get("marked_by")
+                        "marked_by": attendance_record.get("marked_by"),
+                        "admin_adjusted": bool(attendance_record.get("admin_adjusted", False)),
+                        "attendance_modified_at": mod_at.isoformat() if hasattr(mod_at, "isoformat") else None,
+                        "attendance_modified_by": attendance_record.get("attendance_modified_by"),
                     }
 
                 student_data = {
@@ -1370,7 +1461,10 @@ class AttendanceController:
 
             # Determine is_present based on status - both PRESENT and LATE are considered present
             is_present = attendance_request.status in [AttendanceStatus.PRESENT, AttendanceStatus.LATE]
-            check_in_time = attendance_request.check_in_time or (datetime.utcnow() if is_present else None)
+            # Coach / branch_manager paths still use this default; student row logic resolves times separately
+            check_in_time = attendance_request.check_in_time or (
+                datetime.utcnow() if is_present else None
+            )
 
             if user_type == "student":
                 # Verify permissions for student attendance
@@ -1407,16 +1501,35 @@ class AttendanceController:
                 if existing:
                     print(f"📝 Found existing attendance record: {existing['id']} - updating instead of creating duplicate")
 
+                    if is_present:
+                        if attendance_request.check_in_time is not None:
+                            new_in = attendance_request.check_in_time
+                        else:
+                            new_in = existing.get("check_in_time") or datetime.utcnow()
+                        if attendance_request.check_out_time is not None:
+                            new_out = attendance_request.check_out_time
+                        else:
+                            new_out = existing.get("check_out_time")
+                    else:
+                        new_in = None
+                        new_out = None
+
+                    _validate_check_in_out_order(new_in, new_out)
+                    now_adj = datetime.utcnow()
+
                     # Update existing record (proper upsert functionality)
                     update_data = {
-                        "check_in_time": check_in_time,
-                        "check_out_time": attendance_request.check_out_time,
+                        "check_in_time": new_in,
+                        "check_out_time": new_out,
                         "is_present": is_present,
                         "status": attendance_request.status.value,  # Store the original status
                         "notes": attendance_request.notes,
                         "marked_by": current_user["id"],
                         "method": AttendanceMethod.MANUAL,
-                        "updated_at": datetime.utcnow()  # Track when it was last updated
+                        "updated_at": now_adj,
+                        "admin_adjusted": True,
+                        "attendance_modified_at": now_adj,
+                        "attendance_modified_by": current_user["id"],
                     }
 
                     result = await db.attendance.update_one(
@@ -1425,6 +1538,25 @@ class AttendanceController:
                     )
 
                     if result.modified_count > 0:
+                        try:
+                            await db[COL_ATTENDANCE_AUDIT].insert_one(
+                                {
+                                    "id": str(uuid.uuid4()),
+                                    "attendance_id": existing["id"],
+                                    "student_id": user_id,
+                                    "course_id": attendance_request.course_id,
+                                    "branch_id": attendance_request.branch_id,
+                                    "admin_id": current_user["id"],
+                                    "action": "student_attendance_update",
+                                    "before_check_in": existing.get("check_in_time"),
+                                    "before_check_out": existing.get("check_out_time"),
+                                    "after_check_in": new_in,
+                                    "after_check_out": new_out,
+                                    "created_at": now_adj,
+                                }
+                            )
+                        except Exception as exc:
+                            logger.warning("attendance audit insert failed: %s", exc)
                         print(f"✅ Successfully updated existing attendance record: {existing['id']}")
                         return {"message": "Student attendance updated successfully", "attendance_id": existing["id"], "action": "updated"}
                     else:
@@ -1433,6 +1565,12 @@ class AttendanceController:
                 else:
                     print(f"➕ No existing attendance found - creating new record")
 
+                    check_in_time = attendance_request.check_in_time or (
+                        datetime.utcnow() if is_present else None
+                    )
+                    check_out_time = attendance_request.check_out_time if is_present else None
+                    _validate_check_in_out_order(check_in_time, check_out_time)
+
                     # Create new attendance record
                     attendance = Attendance(
                         student_id=user_id,
@@ -1440,12 +1578,13 @@ class AttendanceController:
                         branch_id=attendance_request.branch_id,
                         attendance_date=attendance_request.attendance_date,
                         check_in_time=check_in_time,
-                        check_out_time=attendance_request.check_out_time,
+                        check_out_time=check_out_time,
                         method=AttendanceMethod.MANUAL,
                         marked_by=current_user["id"],
                         is_present=is_present,
                         status=attendance_request.status.value,  # Store the original status
-                        notes=attendance_request.notes
+                        notes=attendance_request.notes,
+                        admin_adjusted=False,
                     )
 
                     await db.attendance.insert_one(attendance.dict())
@@ -1478,10 +1617,24 @@ class AttendanceController:
                 if existing:
                     print(f"📝 Found existing coach attendance record: {existing['id']} - updating instead of creating duplicate")
 
+                    if is_present:
+                        if attendance_request.check_in_time is not None:
+                            cin = attendance_request.check_in_time
+                        else:
+                            cin = existing.get("check_in_time") or datetime.utcnow()
+                        if attendance_request.check_out_time is not None:
+                            cout = attendance_request.check_out_time
+                        else:
+                            cout = existing.get("check_out_time")
+                    else:
+                        cin = None
+                        cout = None
+                    _validate_check_in_out_order(cin, cout)
+
                     # Update existing record (proper upsert functionality)
                     update_data = {
-                        "check_in_time": check_in_time,
-                        "check_out_time": attendance_request.check_out_time,
+                        "check_in_time": cin,
+                        "check_out_time": cout,
                         "is_present": is_present,
                         "status": attendance_request.status.value if hasattr(attendance_request.status, 'value') else attendance_request.status,  # Handle both enum and string
                         "notes": attendance_request.notes,
@@ -1505,12 +1658,14 @@ class AttendanceController:
                     print(f"➕ No existing coach attendance found - creating new record")
 
                     # Create new coach attendance record
+                    cout_new = attendance_request.check_out_time if is_present else None
+                    _validate_check_in_out_order(check_in_time, cout_new)
                     coach_attendance = CoachAttendance(
                         coach_id=user_id,
                         branch_id=attendance_request.branch_id,
                         attendance_date=attendance_request.attendance_date,
                         check_in_time=check_in_time,
-                        check_out_time=attendance_request.check_out_time,
+                        check_out_time=cout_new,
                         method=AttendanceMethod.MANUAL,
                         marked_by=current_user["id"],
                         is_present=is_present,
@@ -1622,18 +1777,22 @@ class AttendanceController:
                 course_info = course_map.get(course_id, {})
                 branch_info = branch_map.get(branch_id, {})
 
+                mod_at = record.get("attendance_modified_at") or record.get("updated_at")
                 formatted_record = {
                     "id": record.get("id"),
-                    "date": record.get("attendance_date").strftime("%Y-%m-%d") if record.get("attendance_date") else None,
+                    "date": _attendance_calendar_day(record.get("attendance_date")),
                     "course": course_info.get("title", course_info.get("name", "Unknown Course")),
                     "course_id": course_id,
                     "branch": branch_info.get("branch", {}).get("name", branch_info.get("name", "Unknown Branch")),
                     "branch_id": branch_id,
                     "status": record.get("status", "absent"),
-                    "check_in_time": record.get("check_in_time").strftime("%I:%M %p") if record.get("check_in_time") else None,
-                    "check_out_time": record.get("check_out_time").strftime("%I:%M %p") if record.get("check_out_time") else None,
+                    "check_in_time": _dt_to_ist_ampm(record.get("check_in_time")),
+                    "check_out_time": _dt_to_ist_ampm(record.get("check_out_time")),
                     "is_present": record.get("is_present", False),
-                    "notes": record.get("notes", "")
+                    "notes": record.get("notes", ""),
+                    "admin_adjusted": bool(record.get("admin_adjusted", False)),
+                    "attendance_modified_at": mod_at.isoformat() if hasattr(mod_at, "isoformat") else None,
+                    "attendance_modified_by": record.get("attendance_modified_by"),
                 }
                 formatted_records.append(formatted_record)
 

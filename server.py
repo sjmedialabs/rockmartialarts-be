@@ -8,9 +8,11 @@ import os
 import ssl
 import logging
 from contextlib import asynccontextmanager
+import asyncio
 
 # Import routes
 from routes.reg_checkout_routes import router as reg_checkout_router
+from routes.student_performance_routes import router as student_performance_router
 from routes import (
     auth_router,
     user_router,
@@ -42,15 +44,55 @@ from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
 from routes.upload_routes import router as upload_router
 from routes.cms_routes import router as cms_router
+from routes.homepage_content_routes import router as homepage_content_router
 from routes.achievement_routes import router as achievement_router
+from routes.student_testimonial_routes import router as student_testimonial_router
+from routes.student_showcase_achievement_routes import router as showcase_achievement_router
 from routes.onboarding_routes import router as onboarding_router
 
 # Import database utility
 from utils.database import db
+from controllers.student_performance_controller import ensure_student_performance_indexes
+
+# Reconciliation loop (optional)
+from utils.razorpay_reconciliation import ensure_collections_indexes, reconcile_payments_batch
 
 # Load environment variables
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+
+async def _payments_reconciliation_loop(mongo_db):
+    """
+    Lightweight reconciliation loop.
+    Enabled via PAYMENT_RECONCILIATION_ENABLED=true.
+    """
+    enabled = (os.getenv("PAYMENT_RECONCILIATION_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+    if not enabled:
+        return
+    interval_sec = int(os.getenv("PAYMENT_RECONCILIATION_INTERVAL_SEC", "600") or "600")
+    interval_sec = max(60, interval_sec)
+    lookback_days = int(os.getenv("PAYMENT_RECONCILIATION_LOOKBACK_DAYS", "7") or "7")
+    pending_stuck_min = int(os.getenv("PAYMENT_RECONCILIATION_STUCK_MIN", "5") or "5")
+    limit = int(os.getenv("PAYMENT_RECONCILIATION_LIMIT", "200") or "200")
+
+    await ensure_collections_indexes(mongo_db)
+
+    # Continuous reconcile with sleep; exceptions are caught to avoid crashing the app.
+    while True:
+        try:
+            await reconcile_payments_batch(
+                mongo_db,
+                actor="scheduled_job",
+                reason="scheduled_reconciliation",
+                lookback_days=lookback_days,
+                pending_stuck_minutes=pending_stuck_min,
+                limit=limit,
+            )
+        except Exception:
+            logging.exception("Scheduled payment reconciliation tick failed")
+        await asyncio.sleep(interval_sec)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,10 +109,55 @@ async def lifespan(app: FastAPI):
     # Initialize the database connection in utils
     from utils.database import init_db
     init_db(app.mongodb)
+
+    # Additive indexes (safe to re-run).
+    try:
+        # ESSL mapping: enforce unique employee code when set.
+        await app.mongodb.users.create_index("essl_user_id", unique=True, sparse=True)
+    except Exception:
+        logging.exception("Failed to create users.essl_user_id unique index")
+    try:
+        # Existing admin UI uses `biometric_id` field; use it as the primary ESSL mapping key.
+        await app.mongodb.users.create_index("biometric_id", unique=True, sparse=True)
+    except Exception:
+        logging.exception("Failed to create users.biometric_id unique index")
+
+    # One-time safe normalization: sparse unique indexes still index explicit BSON null / empty string.
+    try:
+        await app.mongodb.users.update_many(
+            {"essl_user_id": {"$type": 10}},
+            {"$unset": {"essl_user_id": ""}},
+        )
+        await app.mongodb.users.update_many(
+            {"essl_user_id": ""},
+            {"$unset": {"essl_user_id": ""}},
+        )
+        await app.mongodb.users.update_many(
+            {"biometric_id": {"$type": 10}},
+            {"$unset": {"biometric_id": ""}},
+        )
+        await app.mongodb.users.update_many(
+            {"biometric_id": ""},
+            {"$unset": {"biometric_id": ""}},
+        )
+    except Exception:
+        logging.exception("Failed to normalize null/empty biometric mapping fields on users")
+
+    try:
+        await ensure_student_performance_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure student performance dashboard indexes")
+
+    # Start scheduled reconciliation (additive; safe when disabled)
+    reconcile_task = asyncio.create_task(_payments_reconciliation_loop(app.mongodb))
     
     yield
     
     # Shutdown
+    try:
+        reconcile_task.cancel()
+    except Exception:
+        pass
     app.mongodb_client.close()
 
 # Create FastAPI app
@@ -107,6 +194,23 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
+
+@app.middleware("http")
+async def disable_http_caching(request: Request, call_next):
+    """Always serve fresh API data; prevent stale browser/proxy caches."""
+    response = await call_next(request)
+
+    path = request.url.path or ""
+    # Apply strict no-store to all API responses and health checks used by dashboards.
+    if path.startswith("/api/") or path in {"/health"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["Surrogate-Control"] = "no-store"
+        # Helps some proxies/CDNs avoid coalescing stale variants.
+        response.headers["Vary"] = "Authorization, Cookie, Origin"
+    return response
+
 # Include routers
 app.include_router(superadmin_router, prefix="/api/superadmin", tags=["Super Admin"])
 app.include_router(auth_router, prefix="/api/auth", tags=["Authentication"])
@@ -137,9 +241,15 @@ app.include_router(attendance_router, prefix="/api/attendance", tags=["Attendanc
 app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches with Courses"])
 app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
+app.include_router(homepage_content_router, prefix="/api/homepage", tags=["Homepage Content"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
+app.include_router(student_testimonial_router, prefix="/api/testimonials", tags=["Marketing Testimonials"])
+app.include_router(
+    showcase_achievement_router, prefix="/api/showcase-achievements", tags=["Marketing Achievements"]
+)
 app.include_router(onboarding_router, prefix="/api/onboarding", tags=["Onboarding"])
 app.include_router(reg_checkout_router, prefix="/api/reg-checkout", tags=["Registration Checkout"])
+app.include_router(student_performance_router, prefix="/api/student", tags=["Student Performance"])
 
 @app.get("/")
 async def root():

@@ -9,6 +9,53 @@ from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.student_branch_sync import count_students_for_branch
+
+
+async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
+    """Add trainer_name to each batch in assignments.course_schedule (mutates branch)."""
+    asg = branch.get("assignments")
+    if not isinstance(asg, dict):
+        return
+    sched = asg.get("course_schedule")
+    if not isinstance(sched, list) or not sched:
+        return
+    ids = set()
+    for entry in sched:
+        if not isinstance(entry, dict):
+            continue
+        for b in entry.get("batches") or []:
+            if not isinstance(b, dict):
+                continue
+            cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
+            if cid:
+                ids.add(cid)
+    if not ids:
+        return
+    users = await db.users.find({"id": {"$in": list(ids)}}).to_list(length=300)
+    name_map = {}
+    for u in users:
+        fn = (u.get("first_name") or "").strip()
+        ln = (u.get("last_name") or "").strip()
+        name_map[u["id"]] = (
+            f"{fn} {ln}".strip()
+            or (u.get("full_name") or "").strip()
+            or (u.get("email") or "").strip()
+            or "Trainer"
+        )
+    for entry in sched:
+        if not isinstance(entry, dict):
+            continue
+        batches = entry.get("batches")
+        if not isinstance(batches, list):
+            continue
+        for b in batches:
+            if not isinstance(b, dict):
+                continue
+            cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
+            if cid and name_map.get(cid):
+                b["trainer_name"] = name_map[cid]
+
 
 def _pydantic_dump(model) -> dict:
     """BranchUpdate payload as plain dicts for MongoDB (Pydantic v1/v2)."""
@@ -40,6 +87,7 @@ class BranchController:
     async def get_branches(
         skip: int = 0,
         limit: int = 50,
+        active_only: bool = True,
         current_user: dict = None
     ):
         """Get branches with nested structure and statistics, filtered by user role"""
@@ -49,7 +97,9 @@ class BranchController:
         db = get_db()
 
         # Build filter query based on user role
-        filter_query = {"is_active": True}
+        filter_query: dict = {}
+        if active_only:
+            filter_query["is_active"] = True
         current_role = current_user.get("role")
 
         if current_role == "branch_manager":
@@ -102,39 +152,8 @@ class BranchController:
                 })
                 coach_count += admin_coaches
 
-            # Count students - FIXED VERSION with comprehensive verification
             branch_id = branch["id"]
-            student_count = 0
-
-            # Method 1: Count students directly assigned to this branch
-            method1_count = await db.users.count_documents({
-                "role": "student",
-                "branch_id": branch_id,
-                "is_active": True
-            })
-
-            # Method 2: Count students with nested branch structure
-            method2_count = await db.users.count_documents({
-                "role": "student",
-                "branch.branch_id": branch_id,
-                "is_active": True
-            })
-
-            # Method 3: Count unique students from enrollments
-            pipeline = [
-                {"$match": {"branch_id": branch_id, "is_active": True}},
-                {"$group": {"_id": "$student_id"}},
-                {"$count": "unique_students"}
-            ]
-            unique_students_result = await db.enrollments.aggregate(pipeline).to_list(length=1)
-            method3_count = unique_students_result[0]["unique_students"] if unique_students_result else 0
-
-            # Use the maximum count from all methods (most comprehensive)
-            student_count = max(method1_count, method2_count, method3_count)
-
-            # CRITICAL FIX: If all methods return 0, ensure we return 0 (not some cached/default value)
-            if method1_count == 0 and method2_count == 0 and method3_count == 0:
-                student_count = 0
+            student_count = await count_students_for_branch(db, branch_id)
 
             # Add statistics to branch data
             branch_with_stats = {
@@ -178,6 +197,7 @@ class BranchController:
         # Format branches for public consumption (include operational_details + assignments for detail page)
         formatted_branches = []
         for branch in branches:
+            await _enrich_course_schedule_trainers(db, branch)
             branch_info = branch.get("branch") or {}
             operational = branch.get("operational_details") or {}
             assignments = branch.get("assignments") or {}
@@ -227,6 +247,7 @@ class BranchController:
         branch = await db.branches.find_one({"id": branch_id, "is_active": True})
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
+        await _enrich_course_schedule_trainers(db, branch)
         return serialize_doc(branch)
 
     @staticmethod
@@ -251,6 +272,7 @@ class BranchController:
         if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", slug, re.I):
             branch = await db.branches.find_one({"id": slug, "is_active": True})
             if branch:
+                await _enrich_course_schedule_trainers(db, branch)
                 return serialize_doc(branch)
         # Find by name slug (check both nested branch.name and top-level name)
         branches = await db.branches.find({"is_active": True}).to_list(length=500)
@@ -259,6 +281,7 @@ class BranchController:
             if not name:
                 continue
             if BranchController._name_to_slug(str(name).strip()) == slug:
+                await _enrich_course_schedule_trainers(db, b)
                 return serialize_doc(b)
         raise HTTPException(status_code=404, detail="Branch not found")
 
@@ -310,38 +333,7 @@ class BranchController:
             })
             coach_count += admin_coaches
 
-        # Count students - FIXED VERSION with comprehensive verification
-        student_count = 0
-
-        # Method 1: Count students directly assigned to this branch
-        method1_count = await db.users.count_documents({
-            "role": "student",
-            "branch_id": branch_id,
-            "is_active": True
-        })
-
-        # Method 2: Count students with nested branch structure
-        method2_count = await db.users.count_documents({
-            "role": "student",
-            "branch.branch_id": branch_id,
-            "is_active": True
-        })
-
-        # Method 3: Count unique students from enrollments
-        pipeline = [
-            {"$match": {"branch_id": branch_id, "is_active": True}},
-            {"$group": {"_id": "$student_id"}},
-            {"$count": "unique_students"}
-        ]
-        unique_students_result = await db.enrollments.aggregate(pipeline).to_list(length=1)
-        method3_count = unique_students_result[0]["unique_students"] if unique_students_result else 0
-
-        # Use the maximum count from all methods (most comprehensive)
-        student_count = max(method1_count, method2_count, method3_count)
-
-        # CRITICAL FIX: If all methods return 0, ensure we return 0 (not some cached/default value)
-        if method1_count == 0 and method2_count == 0 and method3_count == 0:
-            student_count = 0
+        student_count = await count_students_for_branch(db, branch_id)
 
         # Add statistics to branch data
         branch_with_stats = {
@@ -431,43 +423,17 @@ class BranchController:
                     "email": coach.get("email", coach.get("contact_info", {}).get("email", ""))
                 })
 
-        # Count students - try multiple methods to find the correct field structure
-        student_count = 0
+        student_count = await count_students_for_branch(db, branch_id)
+        student_ids = await db.enrollments.distinct(
+            "student_id", {"branch_id": branch_id, "is_active": True}
+        )
         students = []
-
-        # Method 1: Try flat branch_id field
-        students = await db.users.find({
-            "role": "student",
-            "branch_id": branch_id,
-            "is_active": True
-        }).to_list(length=1000)
-
-        # Method 2: If no results, try nested branch.branch_id field
-        if not students:
+        if student_ids:
             students = await db.users.find({
+                "id": {"$in": student_ids},
                 "role": "student",
-                "branch.branch_id": branch_id,
-                "is_active": True
+                "is_active": True,
             }).to_list(length=1000)
-
-        student_count = len(students)
-
-        # Method 3: If still no results, get students from enrollments
-        if student_count == 0:
-            enrollments = await db.enrollments.find({
-                "branch_id": branch_id,
-                "is_active": True
-            }).to_list(length=1000)
-
-            # Get unique student IDs
-            student_ids = list(set([e["student_id"] for e in enrollments]))
-            if student_ids:
-                students = await db.users.find({
-                    "id": {"$in": student_ids},
-                    "role": "student",
-                    "is_active": True
-                }).to_list(length=1000)
-                student_count = len(students)
 
         # Get course statistics
         course_count = len(branch.get("operational_details", {}).get("courses_offered", []))

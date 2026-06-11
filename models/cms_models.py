@@ -15,6 +15,8 @@ class TestimonialItem(BaseModel):
     role: str = ""
     quote: Optional[str] = None
     image: Optional[str] = None
+    branch_id: Optional[str] = None
+    achievement: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -49,6 +51,7 @@ class FooterContent(BaseModel):
     address: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
+    whatsapp_number: Optional[str] = None
     social_facebook: Optional[str] = None
     social_instagram: Optional[str] = None
     social_twitter: Optional[str] = None
@@ -59,6 +62,11 @@ class BrandingSettings(BaseModel):
     navbar_logo: Optional[str] = None
     footer_logo: Optional[str] = None
     favicon: Optional[str] = None
+    # Full-screen site loader (shown on public pages until content loads); JPG/PNG/WEBP/GIF URL
+    site_loader_image: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
 
 
 class CMSContent(BaseModel):

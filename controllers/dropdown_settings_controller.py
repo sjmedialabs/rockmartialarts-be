@@ -26,7 +26,8 @@ class DropdownSettingsController:
         "difficulty_levels",
         "course_durations",
         "qualifications",
-        "passing_years"
+        "passing_years",
+        "student_levels",
     ]
     
     DEFAULT_OPTIONS = {
@@ -123,6 +124,11 @@ class DropdownSettingsController:
             {"value": "PhD", "label": "PhD", "is_active": True, "order": 4},
             {"value": "Diploma", "label": "Diploma", "is_active": True, "order": 5},
             {"value": "Certificate", "label": "Certificate", "is_active": True, "order": 6},
+        ],
+        "student_levels": [
+            {"value": "Beginner", "label": "Beginner", "is_active": True, "order": 1},
+            {"value": "Intermediate", "label": "Intermediate", "is_active": True, "order": 2},
+            {"value": "Expert", "label": "Expert", "is_active": True, "order": 3},
         ],
         "passing_years": [
             {"value": "2024", "label": "2024", "is_active": True, "order": 1},

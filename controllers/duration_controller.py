@@ -259,7 +259,8 @@ class DurationController:
     async def get_durations_by_course(
         course_id: str,
         active_only: bool = True,
-        include_pricing: bool = True
+        include_pricing: bool = True,
+        branch_id: Optional[str] = None,
     ):
         """Get available durations for a specific course - Public endpoint"""
         db = get_db()
@@ -276,14 +277,121 @@ class DurationController:
 
         durations = await db.durations.find(query).sort("display_order", 1).to_list(100)
 
+        # Optional branch context: branch/course tenure fees first; batch schedule only for enabled flags
+        branch_batch = None
+        branch_pricing_for_course: dict = {}
+        if branch_id:
+            from controllers.payment_controller import (
+                _course_branch_pricing_map,
+                _course_fee_per_duration_map,
+            )
+
+            branch = await db.branches.find_one({"id": branch_id})
+            if not branch:
+                raise HTTPException(status_code=404, detail="Branch not found")
+
+            branch_pricing_all = _course_branch_pricing_map(course)
+            bp_entry = branch_pricing_all.get(branch_id)
+            if isinstance(bp_entry, dict):
+                branch_pricing_for_course = bp_entry
+
+            assignments = branch.get("assignments", {}) or {}
+            course_schedule = assignments.get("course_schedule", []) or []
+            for entry in course_schedule:
+                if str(entry.get("course_id", "")) != str(course_id):
+                    continue
+                batches = entry.get("batches", []) or []
+                if batches:
+                    branch_batch = batches[0]
+                break
+
         # Enrich durations with pricing calculations
         enriched_durations = []
         base_price = course.get("pricing", {}).get("amount", 0)
         currency = course.get("pricing", {}).get("currency", "INR")
+        if branch_id:
+            course_fee_per_duration = _course_fee_per_duration_map(course)
+        else:
+            course_fee_per_duration = course.get("fee_per_duration", {}) or {}
+        course_pricing_type_per_duration = course.get("pricing_type_per_duration", {}) or {}
 
         for duration in durations:
             multiplier = duration.get("pricing_multiplier", 1.0)
-            calculated_price = base_price * multiplier if include_pricing else None
+            duration_id = duration.get("id")
+            duration_code = duration.get("code")
+
+            key_candidates = []
+            if duration_id:
+                key_candidates.append(str(duration_id))
+            if duration_code:
+                key_candidates.append(str(duration_code))
+
+            duration_enabled = True
+            price_raw = None
+            # Match payment_controller: fee_per_duration cells are package totals unless marked monthly.
+            pricing_type = "flat"
+            used_branch_config = False
+
+            # Branch/course tenure fees (same source as checkout when no batch is selected)
+            if branch_pricing_for_course:
+                for key in key_candidates:
+                    if key in branch_pricing_for_course and branch_pricing_for_course[key] is not None:
+                        price_raw = branch_pricing_for_course.get(key)
+                        used_branch_config = True
+                        break
+
+            if branch_batch:
+                batch_fee_per_duration = branch_batch.get("fee_per_duration", {}) or {}
+                batch_pricing_type_per_duration = (
+                    branch_batch.get("pricing_type_per_duration", {}) or {}
+                )
+                batch_enabled_per_duration = (
+                    branch_batch.get("enabled_per_duration", {}) or {}
+                )
+
+                for key in key_candidates:
+                    if key in batch_enabled_per_duration:
+                        duration_enabled = bool(batch_enabled_per_duration.get(key))
+                        break
+
+                if price_raw is None:
+                    for key in key_candidates:
+                        if key in batch_fee_per_duration:
+                            price_raw = batch_fee_per_duration.get(key)
+                            pt = batch_pricing_type_per_duration.get(key)
+                            pricing_type = pt if pt is not None and str(pt).strip() else "flat"
+                            used_branch_config = True
+                            break
+
+            if price_raw is None:
+                for key in key_candidates:
+                    if key in course_fee_per_duration:
+                        price_raw = course_fee_per_duration.get(key)
+                        pt = course_pricing_type_per_duration.get(key)
+                        pricing_type = pt if pt is not None and str(pt).strip() else "flat"
+                        break
+
+            calculated_price = None
+            if include_pricing:
+                if price_raw is not None:
+                    try:
+                        parsed = float(price_raw)
+                    except (TypeError, ValueError):
+                        parsed = None
+
+                    if parsed is not None and parsed > 0:
+                        if str(pricing_type).lower() == "flat":
+                            calculated_price = parsed
+                        else:
+                            calculated_price = parsed * float(duration.get("duration_months", 0) or 0)
+                elif not branch_batch:
+                    calculated_price = base_price * multiplier
+
+            if branch_batch and used_branch_config:
+                if not duration_enabled:
+                    continue
+                if include_pricing and (calculated_price is None or calculated_price <= 0):
+                    continue
 
             duration_data = {
                 "id": duration["id"],
@@ -293,7 +401,8 @@ class DurationController:
                 "duration_days": duration.get("duration_days"),
                 "pricing_multiplier": multiplier,
                 "calculated_price": calculated_price,
-                "description": duration.get("description")
+                "description": duration.get("description"),
+                "is_enabled": duration_enabled,
             }
             enriched_durations.append(duration_data)
 

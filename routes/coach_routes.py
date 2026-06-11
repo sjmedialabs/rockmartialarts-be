@@ -52,6 +52,13 @@ async def get_my_profile(
     """Get current coach's profile"""
     return await CoachController.get_coach_by_id(current_user["id"], current_user)
 
+@router.get("/public/homepage")
+async def get_public_homepage_coaches(
+    limit: int = Query(8, ge=1, le=8, description="Max coaches for homepage (ordered by display_order)"),
+):
+    """Public homepage coaches (display_order, then created_at). No authentication."""
+    return await CoachController.get_public_homepage_coaches(limit)
+
 @router.put("/me")
 async def update_my_profile(
     coach_update: CoachUpdate,

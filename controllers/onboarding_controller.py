@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
 from utils.database import get_db
+from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
 from utils.auth import hash_password
 from models.enrollment_models import Enrollment, PaymentStatus
 from models.payment_models import Payment, PaymentType, PaymentMethod, PaymentStatus as PayStatus
@@ -202,6 +203,9 @@ class OnboardingController:
         if isinstance(branch.get("admission_fee"), (int, float)):
             admission_fee = float(branch["admission_fee"])
 
+        if not await should_charge_admission_fee_for_checkout(db, student_id, {"beneficiary_type": "self"}):
+            admission_fee = 0.0
+
         fee_amount = course.get("base_fee")
         if fee_amount is None:
             fee_amount = course.get("pricing", {}).get("amount", 0) if isinstance(course.get("pricing"), dict) else 0
@@ -236,17 +240,7 @@ class OnboardingController:
         await db.enrollments.insert_one(enrollment.dict())
 
         # Optional: create pending payment records so "next month they can pay from application"
-        await db.payments.insert_many([
-            Payment(
-                student_id=student_id,
-                enrollment_id=enrollment.id,
-                amount=admission_fee,
-                payment_type=PaymentType.ADMISSION_FEE,
-                payment_method=PaymentMethod.CASH,
-                payment_status=PayStatus.PENDING,
-                payment_date=_utc_now(),
-                due_date=start_date + timedelta(days=7),
-            ).dict(),
+        payment_docs = [
             Payment(
                 student_id=student_id,
                 enrollment_id=enrollment.id,
@@ -257,6 +251,21 @@ class OnboardingController:
                 payment_date=_utc_now(),
                 due_date=start_date + timedelta(days=30),
             ).dict(),
-        ])
+        ]
+        if admission_fee > 0:
+            payment_docs.insert(
+                0,
+                Payment(
+                    student_id=student_id,
+                    enrollment_id=enrollment.id,
+                    amount=admission_fee,
+                    payment_type=PaymentType.ADMISSION_FEE,
+                    payment_method=PaymentMethod.CASH,
+                    payment_status=PayStatus.PENDING,
+                    payment_date=_utc_now(),
+                    due_date=start_date + timedelta(days=7),
+                ).dict(),
+            )
+        await db.payments.insert_many(payment_docs)
 
         return {"message": "Onboarding complete. You can now log in.", "user_id": student_id}

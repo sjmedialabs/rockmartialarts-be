@@ -10,6 +10,9 @@ Env:
 - form: POST application/x-www-form-urlencoded to SMS_API_URL (field names via SMS_FORM_*).
 - smslogin: GET https://smslogin.co/v3/api.php (docs) with username, apikey, senderid, mobile,
   message, templateid — set SMS_USERNAME, SMS_API_KEY, SMS_SENDER_ID; optional SMS_API_URL override.
+
+Proxy: Outbound requests use a Session with trust_env=False so HTTP_PROXY / HTTPS_PROXY /
+ALL_PROXY pointing at a dead local proxy (e.g. 127.0.0.1) do not break the SMS gateway call.
 """
 
 from __future__ import annotations
@@ -45,14 +48,14 @@ logger = logging.getLogger(__name__)
 MSG91_DEFAULT_URL = "https://api.msg91.com/api/sendhttp.php"
 SMSLOGIN_DEFAULT_URL = "https://smslogin.co/v3/api.php"
 
-# Outbound SMS: disable proxy for this call only (avoids dead HTTP_PROXY on servers).
-# Note: do not pass trust_env= — older `requests` builds raise
-# "Session.request() got an unexpected keyword argument 'trust_env'".
-def _sms_request_kwargs(timeout: int) -> dict:
-    return {
-        "timeout": timeout,
-        "proxies": {"http": None, "https": None},
-    }
+# Outbound SMS must bypass HTTP(S)_PROXY from the environment. Passing
+# proxies={"http": None, "https": None} is not enough in some stacks — urllib3
+# still applies env proxy (e.g. HTTPS_PROXY=http://127.0.0.1:7890), causing
+# ProxyError / connection to 127.0.0.1. Session.trust_env=False fixes that.
+def _sms_http_session() -> requests.Session:
+    sess = requests.Session()
+    sess.trust_env = False
+    return sess
 
 
 def _smslogin_username() -> str:
@@ -124,7 +127,8 @@ def _send_msg91(phone: str, message: str, template_id: Optional[str]) -> SmsSend
         params["DLT_TE_ID"] = template_id
 
     try:
-        r = requests.post(url, data=params, **_sms_request_kwargs(20))
+        with _sms_http_session() as s:
+            r = s.post(url, data=params, timeout=20)
         text = (r.text or "")[:500]
         if r.status_code >= 400:
             logger.error("MSG91 HTTP %s: %s", r.status_code, text)
@@ -165,6 +169,22 @@ def _send_smslogin(phone: str, message: str, template_id: Optional[str]) -> SmsS
         logger.error("smslogin requires SMS_USERNAME, SMS_API_KEY, SMS_SENDER_ID")
         return False, "Missing SMS_USERNAME, SMS_API_KEY, or SMS_SENDER_ID"
 
+    tid_s = (template_id or "").strip()
+    allow_no_tid = os.getenv("SMSLOGIN_ALLOW_NO_TEMPLATE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not tid_s and not allow_no_tid:
+        logger.error(
+            "smslogin: missing DLT template id — Indian DLT OTP usually requires templateid; SMS may not deliver"
+        )
+        return (
+            False,
+            "Set DLT_OTP_VARIABLE_ID to your DLT template id from smslogin (not the message text). "
+            "Override only if your account allows it: SMSLOGIN_ALLOW_NO_TEMPLATE=true.",
+        )
+
     params: Dict[str, Any] = {
         "username": username,
         "apikey": apikey,
@@ -172,11 +192,12 @@ def _send_smslogin(phone: str, message: str, template_id: Optional[str]) -> SmsS
         "mobile": format_sms_mobile(phone),
         "message": message,
     }
-    if template_id:
-        params["templateid"] = template_id
+    if tid_s:
+        params["templateid"] = tid_s
 
     try:
-        r = requests.get(base, params=params, **_sms_request_kwargs(25))
+        with _sms_http_session() as s:
+            r = s.get(base, params=params, timeout=25)
         text = (r.text or "").strip()
         snippet = text[:800]
         if r.status_code >= 400:
@@ -293,7 +314,8 @@ def _send_form(phone: str, message: str, template_id: Optional[str]) -> SmsSendR
             headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        r = requests.post(url, data=data, headers=headers, **_sms_request_kwargs(20))
+        with _sms_http_session() as s:
+            r = s.post(url, data=data, headers=headers, timeout=20)
         if r.status_code >= 400:
             logger.error("SMS form API error %s: %s", r.status_code, r.text[:500])
             return False, f"HTTP {r.status_code}"
@@ -353,7 +375,8 @@ def _send_json(phone: str, message: str, template_id: Optional[str]) -> SmsSendR
             headers["api-key"] = api_key
 
     try:
-        r = requests.post(url, json=payload, headers=headers, **_sms_request_kwargs(20))
+        with _sms_http_session() as s:
+            r = s.post(url, json=payload, headers=headers, timeout=20)
         if r.status_code >= 400:
             logger.error("SMS API error %s: %s", r.status_code, r.text[:500])
             return False, f"HTTP {r.status_code}"

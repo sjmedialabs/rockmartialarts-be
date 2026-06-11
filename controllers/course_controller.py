@@ -1,5 +1,5 @@
 from fastapi import HTTPException, Depends
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from datetime import datetime
 import logging
 
@@ -8,11 +8,103 @@ from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from controllers.student_showcase_achievement_controller import list_for_course_with_fallback
 
 logger = logging.getLogger(__name__)
 
 
-def _public_branch_batches_for_course(branch: dict, course_id: str) -> list:
+def _expand_branch_prices_to_branch_pricing(branch_prices: list) -> Dict[str, Any]:
+    """Build branch_id -> fee map from pricing.branch_prices (same rules as update_course)."""
+    branch_pricing: Dict[str, Any] = {}
+    if not branch_prices:
+        return branch_pricing
+    for bp in branch_prices:
+        bid = bp.get("branch_id") if isinstance(bp, dict) else getattr(bp, "branch_id", None)
+        if not bid:
+            continue
+        bp_fee_per_duration = bp.get("fee_per_duration") if isinstance(bp, dict) else getattr(bp, "fee_per_duration", None)
+        if bp_fee_per_duration and isinstance(bp_fee_per_duration, dict):
+            try:
+                branch_pricing[bid] = {str(k): float(v) for k, v in bp_fee_per_duration.items() if v is not None}
+            except (TypeError, ValueError):
+                pass
+        has_duration_fees = not branch_pricing.get(bid) and any(
+            (bp.get(attr) if isinstance(bp, dict) else getattr(bp, attr, None)) is not None
+            for attr in ("fee_1_month", "fee_3_months", "fee_6_months", "fee_1_year")
+        )
+        if not branch_pricing.get(bid) and has_duration_fees:
+            branch_pricing[bid] = {}
+            for key, attr in [("1-month", "fee_1_month"), ("3-months", "fee_3_months"), ("6-months", "fee_6_months"), ("1-year", "fee_1_year")]:
+                val = bp.get(attr) if isinstance(bp, dict) else getattr(bp, attr, None)
+                if val is not None:
+                    branch_pricing[bid][key] = float(val)
+        elif not branch_pricing.get(bid):
+            amt = bp.get("amount") if isinstance(bp, dict) else getattr(bp, "amount", None)
+            if amt is not None:
+                branch_pricing[bid] = float(amt)
+    return branch_pricing
+
+
+def _merge_branch_pricing_delta(existing: Any, delta: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-merge duration fees per branch; preserve other branches and legacy values."""
+    out: Dict[str, Any] = {}
+    if isinstance(existing, dict):
+        for k, v in existing.items():
+            if isinstance(v, dict):
+                out[k] = dict(v)
+            else:
+                out[k] = v
+    for bid, new_val in delta.items():
+        if isinstance(new_val, dict):
+            cur = out.get(bid)
+            if isinstance(cur, dict):
+                out[bid] = {**cur, **new_val}
+            else:
+                out[bid] = dict(new_val)
+        else:
+            out[bid] = new_val
+    return out
+
+
+def _collect_coach_ids_from_branch_schedule(branch: dict) -> Set[str]:
+    ids: Set[str] = set()
+    sched = (branch.get("assignments") or {}).get("course_schedule") or []
+    for entry in sched:
+        if not isinstance(entry, dict):
+            continue
+        for b in entry.get("batches") or []:
+            if not isinstance(b, dict):
+                continue
+            cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+async def _user_display_names_by_ids(db, user_ids: Set[str]) -> Dict[str, str]:
+    """Map user id -> display name for batch trainers."""
+    if not user_ids:
+        return {}
+    users = await db.users.find({"id": {"$in": list(user_ids)}}).to_list(length=300)
+    out: Dict[str, str] = {}
+    for u in users:
+        fn = (u.get("first_name") or "").strip()
+        ln = (u.get("last_name") or "").strip()
+        label = (
+            f"{fn} {ln}".strip()
+            or (u.get("full_name") or "").strip()
+            or (u.get("email") or "").strip()
+            or "Trainer"
+        )
+        out[u["id"]] = label
+    return out
+
+
+def _public_branch_batches_for_course(
+    branch: dict,
+    course_id: str,
+    coach_names: Optional[Dict[str, str]] = None,
+) -> list:
     """Batches from branch course_schedule for registration (batch_ref matches payment-info)."""
     sched = (branch.get("assignments") or {}).get("course_schedule") or []
     for entry in sched:
@@ -25,8 +117,8 @@ def _public_branch_batches_for_course(branch: dict, course_id: str) -> list:
             bid = str((b.get("batch_id") or b.get("id") or "")).strip()
             ref = bid if bid else f"__index:{i}__"
             days = b.get("days") or []
-            st = str((b.get("start_time") or "")).strip()
-            et = str((b.get("end_time") or "")).strip()
+            st = str((b.get("start_time") or b.get("startTime") or "")).strip()
+            et = str((b.get("end_time") or b.get("endTime") or "")).strip()
             label_parts = []
             if days:
                 label_parts.append(", ".join(str(d) for d in days))
@@ -34,6 +126,8 @@ def _public_branch_batches_for_course(branch: dict, course_id: str) -> list:
                 label_parts.append(f"{st or '—'} – {et or '—'}")
             label = " · ".join(label_parts) if label_parts else f"Batch {i + 1}"
             raw_fee = b.get("batch_fee")
+            if raw_fee is None:
+                raw_fee = b.get("batchFee")
             if raw_fee is None:
                 raw_fee = b.get("fee")
             if raw_fee is None:
@@ -45,17 +139,24 @@ def _public_branch_batches_for_course(branch: dict, course_id: str) -> list:
                 except (TypeError, ValueError):
                     fee = None
             bname = str((b.get("batch_name") or b.get("name") or "")).strip()
-            out.append(
-                {
-                    "batch_ref": ref,
-                    "name": bname or None,
-                    "label": label,
-                    "batch_fee": fee,
-                    "days": days,
-                    "start_time": st,
-                    "end_time": et,
-                }
-            )
+            coach_id = str((b.get("coach_id") or b.get("coachId") or "")).strip()
+            trainer_name = None
+            if coach_names and coach_id:
+                trainer_name = coach_names.get(coach_id)
+            row = {
+                "batch_ref": ref,
+                "name": bname or None,
+                "label": label,
+                "batch_fee": fee,
+                "days": days,
+                "start_time": st,
+                "end_time": et,
+            }
+            if coach_id:
+                row["coach_id"] = coach_id
+            if trainer_name:
+                row["trainer_name"] = trainer_name
+            out.append(row)
         return out
     return []
 
@@ -299,6 +400,16 @@ class CourseController:
         course = await db.courses.find_one({"id": course_id})
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
+
+        if current_user.get("role") == UserRole.BRANCH_MANAGER:
+            manager_id = current_user.get("id")
+            managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
+            if not any(
+                course_id in (b.get("assignments") or {}).get("courses", [])
+                for b in (managed_branches or [])
+            ):
+                raise HTTPException(status_code=404, detail="Course not found")
+
         return serialize_doc(course)
 
     @staticmethod
@@ -399,6 +510,8 @@ class CourseController:
         if not existing_course:
             raise HTTPException(status_code=404, detail="Course not found")
         
+        bm_managed_branches = None
+
         # Coach Admin permission check
         if current_user["role"] == UserRole.COACH_ADMIN:
             # Check if user is the instructor of this course or can manage it
@@ -411,14 +524,14 @@ class CourseController:
             manager_id = current_user["id"]
 
             # Find branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
+            bm_managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
 
-            if not managed_branches:
+            if not bm_managed_branches:
                 raise HTTPException(status_code=403, detail="You don't manage any branches.")
 
             # Check if the course is assigned to any of the managed branches
             course_assigned_to_managed_branch = False
-            for branch in managed_branches:
+            for branch in bm_managed_branches:
                 assigned_courses = branch.get("assignments", {}).get("courses", [])
                 if course_id in assigned_courses:
                     course_assigned_to_managed_branch = True
@@ -426,6 +539,45 @@ class CourseController:
 
             if not course_assigned_to_managed_branch:
                 raise HTTPException(status_code=403, detail="You can only update courses assigned to branches you manage.")
+
+        # Branch managers may only merge branch-specific fees (branch_pricing) for their branches
+        if current_user["role"] == UserRole.BRANCH_MANAGER:
+            managed_branches = bm_managed_branches or []
+            managed_ids = {b["id"] for b in managed_branches}
+            raw = course_update.dict(exclude_unset=True)
+            if not raw:
+                raise HTTPException(status_code=400, detail="No update data provided")
+            pricing = raw.get("pricing")
+            if not isinstance(pricing, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Branch managers can only update branch-specific fees. Send pricing.branch_prices for your branch.",
+                )
+            branch_prices = pricing.get("branch_prices") or []
+            delta_bp = _expand_branch_prices_to_branch_pricing(branch_prices)
+            if not delta_bp:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide at least one branch fee in pricing.branch_prices for your branch.",
+                )
+            for bid in delta_bp.keys():
+                if bid not in managed_ids:
+                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
+                branch_doc = next((b for b in managed_branches if b["id"] == bid), None)
+                if not branch_doc:
+                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
+                assigned = branch_doc.get("assignments", {}).get("courses", [])
+                if course_id not in assigned:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This course is not assigned to that branch.",
+                    )
+            merged_bp = _merge_branch_pricing_delta(existing_course.get("branch_pricing"), delta_bp)
+            update_data = {"branch_pricing": merged_bp, "updated_at": datetime.utcnow()}
+            result = await db.courses.update_one({"id": course_id}, {"$set": update_data})
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="Course not found")
+            return {"message": "Course updated successfully"}
 
         update_data = {k: v for k, v in course_update.dict(exclude_unset=True).items()}
         if not update_data:
@@ -462,6 +614,17 @@ class CourseController:
                             fee_per_duration[key] = float(p[attr])
                 if fee_per_duration:
                     update_data["fee_per_duration"] = fee_per_duration
+                # Persist flat/offer prices to top-level for payment API
+                flat_price_per_duration = {}
+                if p.get("flat_price_per_duration") and isinstance(p.get("flat_price_per_duration"), dict):
+                    for k, v in p["flat_price_per_duration"].items():
+                        if v is not None:
+                            try:
+                                flat_price_per_duration[str(k)] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                if flat_price_per_duration:
+                    update_data["flat_price_per_duration"] = flat_price_per_duration
                 branch_prices = p.get("branch_prices") or []
                 if branch_prices:
                     branch_pricing = {}
@@ -725,6 +888,11 @@ class CourseController:
             d["student_name"] = ach_user_map.get(a["student_id"], "Student")
             student_achievements.append(d)
 
+        fallback_branch_id = branches[0]["id"] if branches else None
+        showcase_achievements = await list_for_course_with_fallback(
+            course_id, fallback_branch_id=fallback_branch_id, limit=30
+        )
+
         branches_offering = [
             {
                 "id": b["id"],
@@ -744,6 +912,7 @@ class CourseController:
             "enrolled_students": enrolled_students,
             "student_reviews": student_reviews,
             "student_achievements": student_achievements,
+            "showcase_achievements": showcase_achievements,
             "branches_offering": branches_offering,
         }
 
@@ -823,6 +992,8 @@ class CourseController:
         }).to_list(length=100)
         branch_timings = (branch.get("operational_details") or {}).get("timings", [])
         durations = await db.durations.find({"is_active": True}).sort("display_order", 1).to_list(100)
+        coach_ids = _collect_coach_ids_from_branch_schedule(branch)
+        coach_names = await _user_display_names_by_ids(db, coach_ids)
         result_courses = []
         for course in courses:
             serialized = serialize_doc(course)
@@ -868,7 +1039,9 @@ class CourseController:
                 "media_resources": serialized.get("media_resources") or {},
                 "pricing": fees,
                 "available_durations": available_durations,
-                "branch_batches": _public_branch_batches_for_course(branch, serialized.get("id")),
+                "branch_batches": _public_branch_batches_for_course(
+                    branch, serialized.get("id"), coach_names
+                ),
             })
         return {"courses": result_courses, "branch_timings": branch_timings}
 

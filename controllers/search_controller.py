@@ -498,7 +498,7 @@ class SearchController:
             student_ids = [student["id"] for student in students]
 
             # Build enrollment filter
-            enrollment_filter = {"student_id": {"$in": student_ids}}
+            enrollment_filter = {"student_id": {"$in": student_ids}, "is_active": True}
             if branch_id and branch_id != "all":
                 enrollment_filter["branch_id"] = branch_id
             if course_id and course_id != "all":

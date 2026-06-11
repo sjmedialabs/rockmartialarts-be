@@ -377,10 +377,8 @@ class ReportsController:
             # We'll handle this in the aggregation pipelines below
 
         elif current_user["role"] == "coach_admin" and current_user.get("branch_id"):
-            filter_query["branch_id"] = current_user["branch_id"]
             managed_branch_ids = [current_user["branch_id"]]
-        elif branch_id and current_user["role"] == "superadmin":
-            filter_query["branch_id"] = branch_id
+        elif branch_id and current_user["role"] in ("superadmin", "super_admin"):
             managed_branch_ids = [branch_id] if branch_id else []
 
         try:

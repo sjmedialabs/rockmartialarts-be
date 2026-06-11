@@ -64,10 +64,16 @@ async def delete_duration(
 async def get_durations_by_course(
     course_id: str,
     active_only: bool = True,
-    include_pricing: bool = True
+    include_pricing: bool = True,
+    branch_id: Optional[str] = None,
 ):
     """Get available durations for a specific course - Public endpoint (no authentication required)"""
-    return await DurationController.get_durations_by_course(course_id, active_only, include_pricing)
+    return await DurationController.get_durations_by_course(
+        course_id,
+        active_only,
+        include_pricing,
+        branch_id=branch_id,
+    )
 
 @router.get("/public/by-location-course")
 async def get_durations_by_location_course(

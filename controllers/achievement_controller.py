@@ -158,3 +158,22 @@ class AchievementController:
             d["student_name"] = user_map.get(a["student_id"], "Student")
             result.append(d)
         return {"achievements": result, "total": total }
+
+    @staticmethod
+    async def get_global_public(skip: int = 0, limit: int = 6):
+        """Public endpoint: most recent achievements across all branches (for homepage)."""
+        db = get_db()
+        cursor = db.student_achievements.find({
+            "is_deleted": False
+        }).sort("created_at", -1).skip(skip).limit(limit)
+        items = await cursor.to_list(length=limit)
+        # Enrich with student names
+        student_ids = list({a["student_id"] for a in items})
+        users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids))
+        user_map = {u["id"]: u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Student" for u in users}
+        result = []
+        for a in items:
+            d = serialize_doc(a)
+            d["student_name"] = user_map.get(a["student_id"], "Student")
+            result.append(d)
+        return {"achievements": result}

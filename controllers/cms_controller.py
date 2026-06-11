@@ -45,6 +45,30 @@ class CMSController:
             )
 
     @staticmethod
+    async def get_branch_testimonials_public(branch_id: str, limit: int = 4):
+        """Student testimonials mapped to a branch (from CMS homepage list)."""
+        try:
+            safe_limit = max(1, min(limit, 20))
+            db = get_db()
+            collection = db.cms_content
+            doc = await collection.find_one({})
+            if not doc:
+                doc = await CMSController._create_default_content()
+            homepage = doc.get("homepage") or {}
+            raw = homepage.get("testimonials") or []
+            matched = [t for t in raw if t.get("branch_id") == branch_id][:safe_limit]
+            return {
+                "testimonials": matched,
+                "testimonials_title": homepage.get("testimonials_title"),
+                "testimonials_subtitle": homepage.get("testimonials_subtitle"),
+            }
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to retrieve branch testimonials: {str(e)}"
+            )
+
+    @staticmethod
     async def update_cms_content(data: CMSContentUpdate, current_user: dict) -> CMSContentResponse:
         """Update CMS content"""
         try:
@@ -96,7 +120,7 @@ class CMSController:
     async def upload_branding_image(field: str, image_url: str, current_user: dict) -> CMSContentResponse:
         """Update a specific branding image (navbar_logo, footer_logo, favicon)"""
         try:
-            if field not in ["navbar_logo", "footer_logo", "favicon"]:
+            if field not in ["navbar_logo", "footer_logo", "favicon", "site_loader_image"]:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid branding field"

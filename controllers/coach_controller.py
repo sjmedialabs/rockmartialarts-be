@@ -15,6 +15,35 @@ from datetime import timedelta
 
 class CoachController:
     @staticmethod
+    def _validate_display_order_value(order: Optional[int]) -> None:
+        if order is None:
+            return
+        if not isinstance(order, int) or order < 0 or order > 999999:
+            raise HTTPException(
+                status_code=400,
+                detail="display_order must be a non-negative integer (0–999999)",
+            )
+
+    @staticmethod
+    async def _assert_display_order_unique(
+        db,
+        order: Optional[int],
+        exclude_coach_id: Optional[str] = None,
+    ) -> None:
+        if order is None:
+            return
+        CoachController._validate_display_order_value(order)
+        q: dict = {"display_order": order, "is_active": True}
+        if exclude_coach_id:
+            q["id"] = {"$ne": exclude_coach_id}
+        dup = await db.coaches.find_one(q)
+        if dup:
+            raise HTTPException(
+                status_code=400,
+                detail="Display order is already used by another active coach",
+            )
+
+    @staticmethod
     async def create_coach(
         coach_data: CoachCreate,
         request: Request,
@@ -22,6 +51,8 @@ class CoachController:
     ):
         """Create new coach with comprehensive nested structure"""
         db = get_db()
+
+        await CoachController._assert_display_order_unique(db, coach_data.display_order)
         
         # Check if user exists
         full_phone = f"{coach_data.contact_info.country_code}{coach_data.contact_info.phone}"
@@ -69,7 +100,12 @@ class CoachController:
             first_name=coach_data.personal_info.first_name,
             last_name=coach_data.personal_info.last_name,
             full_name=full_name,
-            password_hash=hashed_password
+            password_hash=hashed_password,
+            profile_image_url=coach_data.profile_image_url,
+            about_short=coach_data.about_short,
+            featured_on_homepage=coach_data.featured_on_homepage,
+            homepage_rating=coach_data.homepage_rating,
+            display_order=coach_data.display_order,
         )
         
         # Convert to dict for storage (exclude password from contact_info)
@@ -154,6 +190,11 @@ class CoachController:
                 emergency_contact=coach.get("emergency_contact"),  # Include emergency contact
                 full_name=coach["full_name"],
                 is_active=coach["is_active"],
+                profile_image_url=coach.get("profile_image_url"),
+                about_short=coach.get("about_short"),
+                featured_on_homepage=coach.get("featured_on_homepage", False),
+                homepage_rating=coach.get("homepage_rating"),
+                display_order=coach.get("display_order"),
                 created_at=coach["created_at"],
                 updated_at=coach["updated_at"]
             )
@@ -190,11 +231,47 @@ class CoachController:
             emergency_contact=coach.get("emergency_contact"),  # Include emergency contact
             full_name=coach["full_name"],
             is_active=coach["is_active"],
+            profile_image_url=coach.get("profile_image_url"),
+            about_short=coach.get("about_short"),
+            featured_on_homepage=coach.get("featured_on_homepage", False),
+            homepage_rating=coach.get("homepage_rating"),
+            display_order=coach.get("display_order"),
             created_at=coach["created_at"],
             updated_at=coach["updated_at"]
         )
         
         return coach_response.dict()
+
+    @staticmethod
+    async def get_public_homepage_coaches(limit: int = 8):
+        """Active coaches for homepage: display_order ASC (unset last), then created_at DESC. Max 8."""
+        db = get_db()
+        safe_limit = max(1, min(int(limit), 8))
+        pipeline = [
+            {"$match": {"is_active": True}},
+            {"$addFields": {"_sort_ord": {"$ifNull": ["$display_order", 999999]}}},
+            {"$sort": {"_sort_ord": 1, "created_at": -1}},
+            {"$limit": safe_limit},
+            {"$project": {"_sort_ord": 0}},
+        ]
+        coaches = await db.coaches.aggregate(pipeline).to_list(length=safe_limit)
+        out = []
+        for c in coaches:
+            pi = c.get("personal_info") or {}
+            prof = c.get("professional_info") or {}
+            name = (c.get("full_name") or f"{pi.get('first_name', '')} {pi.get('last_name', '')}").strip()
+            about = (c.get("about_short") or "").strip()
+            if len(about) > 280:
+                about = about[:277] + "..."
+            out.append({
+                "id": c.get("id"),
+                "full_name": name or "Coach",
+                "designation": prof.get("designation_id") or "",
+                "about_short": about,
+                "profile_image_url": c.get("profile_image_url"),
+                "rating": c.get("homepage_rating"),
+            })
+        return {"coaches": out}
 
     @staticmethod
     async def update_coach(
@@ -297,16 +374,35 @@ class CoachController:
         if coach_update.is_active is not None:  # ✅ add this
             update_data["is_active"] = coach_update.is_active
 
-        if not update_data:
+        patch = coach_update.dict(exclude_unset=True)
+        if "profile_image_url" in patch:
+            update_data["profile_image_url"] = patch["profile_image_url"]
+        if "about_short" in patch:
+            update_data["about_short"] = patch["about_short"]
+        if "featured_on_homepage" in patch:
+            update_data["featured_on_homepage"] = patch["featured_on_homepage"]
+        if "homepage_rating" in patch:
+            update_data["homepage_rating"] = patch["homepage_rating"]
+
+        mongo_unset: dict = {}
+        if "display_order" in patch:
+            if patch["display_order"] is None:
+                mongo_unset["display_order"] = ""
+            else:
+                await CoachController._assert_display_order_unique(
+                    db, patch["display_order"], coach_id
+                )
+                update_data["display_order"] = patch["display_order"]
+
+        if not update_data and not mongo_unset:
             raise HTTPException(status_code=400, detail="No update data provided")
-        
+
         update_data["updated_at"] = datetime.utcnow()
-        
-        # Update coach
-        result = await db.coaches.update_one(
-            {"id": coach_id},
-            {"$set": update_data}
-        )
+
+        update_doc: dict = {"$set": update_data}
+        if mongo_unset:
+            update_doc["$unset"] = mongo_unset
+        result = await db.coaches.update_one({"id": coach_id}, update_doc)
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Coach not found")

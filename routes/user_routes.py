@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request, Path
 from typing import Optional
 from controllers.user_controller import UserController
-from models.user_models import UserCreate, UserUpdate, UserRole
+from models.user_models import UserCreate, UserUpdate, UserRole, StudentNotifyBody
 from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 
@@ -29,10 +29,13 @@ async def get_users(
 @router.get("/students/details")
 async def get_student_details(
     unassigned_only: Optional[bool] = False,
+    branch_id: Optional[str] = None,
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get detailed student information. If unassigned_only=true, returns only students with no active branch enrollment (for Assign to Branch)."""
-    return await UserController.get_student_details(current_user, unassigned_only=unassigned_only)
+    return await UserController.get_student_details(
+        current_user, unassigned_only=unassigned_only, branch_id=branch_id
+    )
 
 @router.get("/{user_id}/enrollments")
 async def get_user_enrollments(
@@ -49,6 +52,18 @@ async def get_user_payments(
 ):
     """Get payment history for a specific student"""
     return await UserController.get_user_payments(user_id, current_user)
+
+
+@router.post("/{user_id}/notify-student")
+async def notify_student(
+    user_id: str,
+    body: StudentNotifyBody,
+    request: Request,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Send welcome or payment reminder via SMS + WhatsApp (super admin)."""
+    return await UserController.send_student_notification(user_id, body.kind, request, current_user)
+
 
 @router.get("/{user_id}")
 async def get_user_by_id(

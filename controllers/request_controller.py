@@ -98,25 +98,18 @@ class RequestController:
         )
 
         if update_data.status == TransferRequestStatus.APPROVED:
+            from utils.student_branch_sync import sync_student_branch_assignment
+
             new_branch_id = transfer_request["new_branch_id"]
             student_id = transfer_request["student_id"]
-            enrollment_id = transfer_request.get("enrollment_id")
+            old_branch_id = transfer_request.get("current_branch_id")
 
-            new_branch = await db.branches.find_one({"id": new_branch_id})
-            location_id = (new_branch or {}).get("location_id")
-
-            user_set = {"branch_id": new_branch_id}
-            if location_id:
-                user_set["branch.location_id"] = location_id
-                user_set["branch.branch_id"] = new_branch_id
-
-            await db.users.update_one({"id": student_id}, {"$set": user_set})
-
-            if enrollment_id:
-                await db.enrollments.update_one(
-                    {"id": enrollment_id, "student_id": student_id},
-                    {"$set": {"branch_id": new_branch_id, "updated_at": datetime.utcnow()}},
-                )
+            await sync_student_branch_assignment(
+                db,
+                student_id,
+                new_branch_id,
+                old_branch_id=old_branch_id,
+            )
 
         return {"message": "Transfer request updated successfully.", "request": serialize_doc(updated_request)}
 

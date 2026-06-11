@@ -4,17 +4,111 @@ import uuid
 import secrets
 import csv
 import io
-from typing import Optional
+import os
+import logging
+import requests
+from typing import Optional, Tuple, Dict
 
-from models.payment_models import PaymentStatus, PaymentType, PaymentMethod, Payment, RegistrationPaymentCreate, RegistrationPaymentResponse
-from models.student_models import StudentPaymentCreate, CoursePaymentInfo, ConfirmRazorpayPayment
+logger = logging.getLogger(__name__)
+
+from models.payment_models import (
+    PaymentStatus,
+    PaymentType,
+    PaymentMethod,
+    Payment,
+    RegistrationPaymentCreate,
+    RegistrationPaymentResponse,
+    AdminPaymentRecoveryBody,
+)
+from models.enrollment_models import Enrollment as EnrollmentModel, PaymentStatus as EnrollmentPaymentStatus
+from models.student_models import (
+    StudentPaymentCreate,
+    CoursePaymentInfo,
+    ConfirmRazorpayPayment,
+    PrepareStudentCheckoutBody,
+    CreateStudentRazorpayOrderBody,
+)
 from models.user_models import UserRole, UserCreate
 from models.notification_models import PaymentNotification, PaymentNotificationCreate
 from utils.auth import require_role
 from utils.database import get_db
 from utils.helpers import send_whatsapp
-from utils.enrollment_dates import resolve_enrollment_end_date
+from utils.enrollment_dates import resolve_enrollment_end_date, enrollment_subscription_end_after_payment
+from utils.subscription_dates import is_subscription_period_over, subscription_end_of_day_utc
 from controllers.settings_controller import SettingsController
+from utils.razorpay_client import get_razorpay_client, verify_razorpay_signature
+from utils.razorpay_reconciliation import (
+    ensure_collections_indexes,
+    get_last_reconciled_at,
+    reconcile_payments_batch,
+    reconcile_one_payment_row,
+    normalize_gateway_fields,
+    map_gateway_to_internal_status,
+)
+from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
+from utils.student_branch_sync import get_student_assigned_branch_id
+from controllers.course_controller import _expand_branch_prices_to_branch_pricing
+
+
+async def _enforce_student_assigned_branch(
+    db,
+    student_id: str,
+    requested_branch_id: str,
+    current_user: dict,
+) -> None:
+    """Existing students must checkout at their assigned branch (renewal or new course)."""
+    assigned = await get_student_assigned_branch_id(db, student_id)
+    if not assigned or str(requested_branch_id or "") == assigned:
+        return
+    user_role = str(current_user.get("role") or "").lower()
+    if user_role in ("super_admin", "superadmin"):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "You cannot change the branch when renewing or enrolling in a course. "
+            "Please use your assigned branch or contact admin for a branch transfer."
+        ),
+    )
+
+
+def _course_fee_per_duration_map(course: dict) -> dict:
+    """Course-level tenure fees (top-level or nested under pricing)."""
+    fpd = course.get("fee_per_duration") or {}
+    if isinstance(fpd, dict) and fpd:
+        return fpd
+    pricing = course.get("pricing") or {}
+    if isinstance(pricing, dict):
+        nested = pricing.get("fee_per_duration") or {}
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _course_branch_pricing_map(course: dict) -> dict:
+    """Merged branch_id -> duration fees from branch_pricing and pricing.branch_prices."""
+    out: dict = {}
+    raw = course.get("branch_pricing") or {}
+    if isinstance(raw, dict):
+        out.update(raw)
+    pricing = course.get("pricing") or {}
+    if isinstance(pricing, dict):
+        branch_prices = pricing.get("branch_prices") or []
+        expanded = _expand_branch_prices_to_branch_pricing(branch_prices)
+        for bid, val in expanded.items():
+            if bid not in out:
+                out[bid] = val
+            elif isinstance(out.get(bid), dict) and isinstance(val, dict):
+                merged = dict(out[bid])
+                merged.update(val)
+                out[bid] = merged
+    return out
+
+
+def _enrollment_checkout_total_inr(enrollment: dict) -> float:
+    fee = float(enrollment.get("fee_amount") or 0)
+    adm = float(enrollment.get("admission_fee") or 0)
+    return fee + adm
 
 
 def _duration_price_keys(duration: str, duration_info: Optional[dict]) -> list:
@@ -65,6 +159,8 @@ def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
         return None
     raw = batch_doc.get("batch_fee")
     if raw is None:
+        raw = batch_doc.get("batchFee")
+    if raw is None:
         raw = batch_doc.get("fee")
     if raw is None:
         raw = batch_doc.get("price")
@@ -79,13 +175,493 @@ def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
     return v
 
 
+def _fetch_razorpay_payment_entity(payment_id: str) -> Optional[dict]:
+    """Fetch payment entity from Razorpay REST API (method, card network, etc.)."""
+    key = (os.getenv("RAZORPAY_KEY_ID") or "").strip()
+    secret = (os.getenv("RAZORPAY_KEY_SECRET") or "").strip()
+    if not key or not secret or not payment_id:
+        return None
+    url = f"https://api.razorpay.com/v1/payments/{payment_id}"
+    sess = requests.Session()
+    sess.trust_env = False
+    try:
+        r = sess.get(url, auth=(key, secret), timeout=25)
+        if r.status_code == 200:
+            return r.json()
+        logger.warning("Razorpay payment fetch HTTP %s for %s", r.status_code, payment_id)
+    except Exception:
+        logger.exception("Razorpay payment fetch failed for %s", payment_id)
+    return None
+
+
+def _razorpay_method_to_payment_fields(entity: dict) -> Tuple[str, str, str]:
+    """
+    Map Razorpay payment entity to (payment_method enum, gateway_method raw, human label).
+    """
+    method = (entity.get("method") or "").lower()
+    if method == "upi":
+        vpa = entity.get("vpa") or entity.get("email")
+        label = "UPI"
+        if vpa:
+            label = f"UPI ({vpa})"
+        return PaymentMethod.UPI.value, "upi", label
+    if method == "card":
+        card = entity.get("card") or {}
+        network = (card.get("network") or "").upper()
+        last4 = card.get("last4") or ""
+        ctype = (card.get("type") or "").lower()
+        if ctype in ("debit", "credit"):
+            pm = PaymentMethod.DEBIT_CARD.value if ctype == "debit" else PaymentMethod.CREDIT_CARD.value
+        else:
+            pm = PaymentMethod.DEBIT_CARD.value
+        parts = [p for p in [network or None, f"••••{last4}" if last4 else None] if p]
+        label = f"Card ({' '.join(parts)})" if parts else "Card"
+        return pm, "card", label
+    if method == "netbanking":
+        bank = (entity.get("bank") or "") or ""
+        label = f"Net Banking ({bank})" if bank else "Net Banking"
+        return PaymentMethod.NET_BANKING.value, "netbanking", label
+    if method == "wallet":
+        wname = (entity.get("wallet") or "") or ""
+        label = f"Wallet ({wname})" if wname else "Wallet"
+        return PaymentMethod.DIGITAL_WALLET.value, "wallet", label
+    if method == "emi":
+        return PaymentMethod.CREDIT_CARD.value, "emi", "EMI"
+    label = (method or "Razorpay").replace("_", " ").title()
+    return PaymentMethod.DIGITAL_WALLET.value, method or "unknown", label
+
+
 class PaymentController:
+    @staticmethod
+    def _safe_webhook_event_id(payload: dict) -> str:
+        """
+        Create a stable idempotency key for webhook events.
+        Razorpay does not guarantee a global event id in all payloads, so derive one.
+        """
+        try:
+            event = str(payload.get("event") or "").strip()
+            created_at = str(payload.get("created_at") or payload.get("createdAt") or "").strip()
+            ent = (((payload.get("payload") or {}).get("payment") or {}).get("entity") or {})
+            pay_id = str(ent.get("id") or "").strip()
+            order_id = str(ent.get("order_id") or "").strip()
+            if pay_id:
+                return f"rzp:{event}:{pay_id}:{created_at}"
+            if order_id:
+                return f"rzp:{event}:{order_id}:{created_at}"
+            return f"rzp:{event}:{created_at}:{uuid.uuid4()}"
+        except Exception:
+            return f"rzp:unknown:{uuid.uuid4()}"
+
+    @staticmethod
+    async def process_razorpay_webhook(payload: dict, headers: Optional[dict] = None):
+        """
+        Idempotent webhook processor. Does NOT replace the existing frontend confirm flow;
+        it only makes the system resilient when callbacks fail.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        await ensure_collections_indexes(db)
+
+        event_id = PaymentController._safe_webhook_event_id(payload or {})
+        now = datetime.utcnow()
+
+        # Store webhook payload log (duplicate-safe).
+        try:
+            ins = await db.razorpay_webhook_events.update_one(
+                {"event_id": event_id},
+                {
+                    "$setOnInsert": {
+                        "event_id": event_id,
+                        "created_at": now,
+                        "event": payload.get("event"),
+                        "payload": payload,
+                        "headers": headers or {},
+                    }
+                },
+                upsert=True,
+            )
+            if not ins.upserted_id and ins.matched_count:
+                # Already processed/logged; still attempt reconcile as retry-safe (idempotent updates).
+                pass
+        except Exception:
+            logger.exception("Failed to persist webhook event log event_id=%s", event_id)
+
+        # Extract Razorpay entity (payment/order/refund events).
+        pld = payload.get("payload") if isinstance(payload, dict) else {}
+        payment_entity = None
+        if isinstance(pld, dict):
+            payment_entity = ((pld.get("payment") or {}).get("entity")) if isinstance(pld.get("payment"), dict) else None
+        if not isinstance(payment_entity, dict):
+            payment_entity = None
+
+        refund_entity = None
+        if isinstance(pld, dict):
+            refund_entity = ((pld.get("refund") or {}).get("entity")) if isinstance(pld.get("refund"), dict) else None
+        if not isinstance(refund_entity, dict):
+            refund_entity = None
+
+        # Use payment entity as main reconciliation input when present.
+        razorpay_payment_id = None
+        razorpay_order_id = None
+        if payment_entity:
+            razorpay_payment_id = str(payment_entity.get("id") or "").strip() or None
+            razorpay_order_id = str(payment_entity.get("order_id") or "").strip() or None
+        elif refund_entity:
+            razorpay_payment_id = str(refund_entity.get("payment_id") or "").strip() or None
+
+        # Find matching local payment rows.
+        candidates = []
+        try:
+            q = {"$or": []}
+            if razorpay_payment_id:
+                q["$or"].append({"razorpay_payment_id": razorpay_payment_id})
+                q["$or"].append({"transaction_id": razorpay_payment_id})
+            if razorpay_order_id:
+                q["$or"].append({"razorpay_order_id": razorpay_order_id})
+            if not q["$or"]:
+                q = None
+            if q:
+                candidates = await db.payments.find(q).sort("created_at", -1).to_list(length=10)
+        except Exception:
+            logger.exception("Webhook candidate lookup failed event_id=%s", event_id)
+            candidates = []
+
+        updated = 0
+        for row in candidates:
+            try:
+                # If webhook includes entity, reconcile using it directly (avoid extra Razorpay fetch).
+                if payment_entity:
+                    norm = normalize_gateway_fields(payment_entity)
+                    mapped = map_gateway_to_internal_status(
+                        str(norm.get("razorpay_status") or ""),
+                        norm.get("razorpay_captured"),
+                        norm.get("razorpay_refunded_amount_paise"),
+                        norm.get("razorpay_amount_paise"),
+                    )
+                    patch = {
+                        **norm,
+                        "payment_status": mapped["payment_status"],
+                        "refund_status": mapped["refund_status"],
+                        "status": "success" if mapped["payment_status"] == "paid" else (mapped["payment_status"] or row.get("status")),
+                        "reconciled_at": now,
+                        "reconciled_by": "razorpay_webhook",
+                        "reconciliation_reason": f"webhook:{payload.get('event') or 'unknown'}",
+                        "updated_at": now,
+                    }
+                    res = await db.payments.update_one({"_id": row["_id"]}, {"$set": patch})
+                    if res.modified_count:
+                        updated += 1
+                    # Ensure enrollment is active/paid on success (subscription auto repair).
+                    if mapped["payment_status"] == "paid" and (row.get("enrollment_id") or patch.get("enrollment_id")):
+                        eid = patch.get("enrollment_id") or row.get("enrollment_id")
+                        await db.enrollments.update_one(
+                            {"id": eid},
+                            {
+                                "$set": {"payment_status": "paid", "is_active": True, "updated_at": now},
+                                "$unset": {"status": ""},
+                            },
+                        )
+                        await db.payments.update_many(
+                            {
+                                "enrollment_id": eid,
+                                "payment_status": {"$in": ["pending", "processing", "failed"]},
+                                "_id": {"$ne": row["_id"]},
+                            },
+                            {"$set": {"payment_status": "cancelled", "status": "cancelled", "updated_at": now}},
+                        )
+                else:
+                    out = await reconcile_one_payment_row(
+                        db,
+                        row,
+                        actor="razorpay_webhook",
+                        reason=f"webhook:{payload.get('event') or 'unknown'}",
+                    )
+                    if out.get("updated"):
+                        updated += 1
+            except Exception:
+                logger.exception("Webhook reconcile failed event_id=%s payment_row=%s", event_id, row.get("id"))
+
+        # Update last sync marker even if no candidates matched (so ops can see webhook activity).
+        try:
+            from utils.razorpay_reconciliation import set_last_reconciled_at
+
+            await set_last_reconciled_at(db, now)
+        except Exception:
+            pass
+
+        return {"ok": True, "event_id": event_id, "matched_rows": len(candidates), "updated_rows": updated}
+
+    @staticmethod
+    async def sync_razorpay_payments(current_user: dict):
+        """Admin-triggered reconciliation run (safe, idempotent)."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        await ensure_collections_indexes(db)
+
+        actor = str(current_user.get("id") or current_user.get("user_id") or "super_admin")
+        out = await reconcile_payments_batch(
+            db,
+            actor=actor,
+            reason="admin_manual_sync",
+            lookback_days=30,
+            pending_stuck_minutes=5,
+            limit=300,
+        )
+        # Return strictly JSON-serializable output (avoid leaking any BSON types).
+        last = await get_last_reconciled_at(db)
+        return {
+            "ok": True,
+            "checked": int(out.get("checked") or 0),
+            "updated": int(out.get("updated") or 0),
+            "last_razorpay_sync_at": last.isoformat() if last else None,
+        }
+
+    @staticmethod
+    async def sync_one_razorpay_payment(current_user: dict, *, payment_id: Optional[str] = None, order_id: Optional[str] = None):
+        """
+        Reconcile a single Razorpay payment/order against local DB.
+        Useful for immediate manual repair (e.g., a specific student case).
+        """
+        if not payment_id and not order_id:
+            raise HTTPException(status_code=400, detail="Provide payment_id or order_id")
+
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        await ensure_collections_indexes(db)
+
+        q = {"$or": []}
+        if payment_id:
+            q["$or"].append({"razorpay_payment_id": payment_id})
+            q["$or"].append({"transaction_id": payment_id})
+        if order_id:
+            q["$or"].append({"razorpay_order_id": order_id})
+        if not q["$or"]:
+            raise HTTPException(status_code=400, detail="Invalid query")
+
+        rows = await db.payments.find(q).sort("created_at", -1).limit(5).to_list(length=5)
+        actor = str(current_user.get("id") or current_user.get("user_id") or "super_admin")
+
+        checked = 0
+        updated = 0
+        for row in rows:
+            checked += 1
+            out = await reconcile_one_payment_row(
+                db,
+                row,
+                actor=actor,
+                reason="admin_single_sync",
+            )
+            if out.get("updated"):
+                updated += 1
+
+        last = await get_last_reconciled_at(db)
+        return {
+            "ok": True,
+            "matched_rows": len(rows),
+            "checked": checked,
+            "updated": updated,
+            "last_razorpay_sync_at": last.isoformat() if last else None,
+        }
+
+    @staticmethod
+    def _payment_status_rank(status: Optional[str]) -> int:
+        s = str(status or "").strip().lower()
+        order = {
+            "paid": 5,
+            "completed": 5,
+            "processing": 4,
+            "pending": 3,
+            "overdue": 2,
+            "failed": 1,
+            "cancelled": 0,
+            "canceled": 0,
+        }
+        return order.get(s, -1)
+
+    @staticmethod
+    def _payment_dedup_key(payment: dict) -> str:
+        """One logical checkout/payment record key.
+
+        Repeated retries often create multiple pending rows with different order ids.
+        Prefer enrollment-level grouping when transaction id is not available yet.
+        """
+        tx_id = str(payment.get("transaction_id") or "").strip()
+        if tx_id:
+            return f"txn:{tx_id}"
+
+        enrollment_id = str(payment.get("enrollment_id") or "").strip()
+        if enrollment_id:
+            return f"enr:{enrollment_id}"
+
+        order_id = str(payment.get("razorpay_order_id") or "").strip()
+        if order_id:
+            return f"order:{order_id}"
+
+        payment_id = str(payment.get("id") or "").strip()
+        return f"id:{payment_id}"
+
+    @staticmethod
+    def _pick_better_payment(existing: dict, candidate: dict) -> dict:
+        """Pick the most meaningful row for a dedupe key."""
+        existing_rank = PaymentController._payment_status_rank(existing.get("payment_status"))
+        candidate_rank = PaymentController._payment_status_rank(candidate.get("payment_status"))
+        if candidate_rank != existing_rank:
+            return candidate if candidate_rank > existing_rank else existing
+
+        # Prefer row with real transaction id
+        existing_has_tx = bool(str(existing.get("transaction_id") or "").strip())
+        candidate_has_tx = bool(str(candidate.get("transaction_id") or "").strip())
+        if candidate_has_tx != existing_has_tx:
+            return candidate if candidate_has_tx else existing
+
+        # Then keep latest updated/created timestamp
+        existing_ts = existing.get("updated_at") or existing.get("created_at")
+        candidate_ts = candidate.get("updated_at") or candidate.get("created_at")
+        if existing_ts is None:
+            return candidate
+        if candidate_ts is None:
+            return existing
+        return candidate if candidate_ts > existing_ts else existing
+
+    @staticmethod
+    async def admin_sync_enrollment_payment_status(current_user: dict):
+        """
+        One-time/maintenance repair:
+        1) backfill payments.enrollment_id from razorpay_order_id when missing
+        2) mark enrollments paid where latest linked payment succeeded
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        actor_id = current_user.get("id") if isinstance(current_user, dict) else None
+        now = datetime.utcnow()
+        repaired_payment_links = 0
+        updated_enrollments = 0
+
+        # 1) Backfill missing enrollment link by order_id -> enrollment.razorpay_last_order_id
+        missing_filter = {
+            "$or": [{"enrollment_id": {"$exists": False}}, {"enrollment_id": None}, {"enrollment_id": ""}],
+            "razorpay_order_id": {"$exists": True, "$ne": None},
+        }
+        async for p in db.payments.find(missing_filter):
+            student_id = p.get("student_id") or p.get("user_id")
+            order_id = p.get("razorpay_order_id")
+            if not student_id or not order_id:
+                continue
+            enrollment = await db.enrollments.find_one(
+                {"student_id": student_id, "razorpay_last_order_id": order_id},
+                {"id": 1, "course_id": 1},
+            )
+            if not enrollment:
+                continue
+            upd = await db.payments.update_one(
+                {"_id": p["_id"]},
+                {
+                    "$set": {
+                        "enrollment_id": enrollment["id"],
+                        "course_id": enrollment.get("course_id"),
+                        "updated_at": now,
+                    }
+                },
+            )
+            if upd.modified_count:
+                repaired_payment_links += 1
+
+        # 2) Latest successful payment per enrollment -> enrollment.payment_status='paid'
+        pipeline = [
+            {
+                "$match": {
+                    "enrollment_id": {"$exists": True, "$ne": None, "$ne": ""},
+                    "$or": [{"payment_status": PaymentStatus.PAID.value}, {"status": "success"}],
+                }
+            },
+            {"$sort": {"created_at": -1}},
+            {"$group": {"_id": "$enrollment_id"}},
+        ]
+        rows = await db.payments.aggregate(pipeline).to_list(length=None)
+        for row in rows:
+            enrollment_id = row.get("_id")
+            if not enrollment_id:
+                continue
+            upd = await db.enrollments.update_one(
+                {"id": enrollment_id},
+                {"$set": {"payment_status": EnrollmentPaymentStatus.PAID.value, "updated_at": now}},
+            )
+            if upd.modified_count:
+                updated_enrollments += 1
+
+        return {
+            "message": "Enrollment/payment sync completed",
+            "repaired_payment_links": repaired_payment_links,
+            "updated_enrollments": updated_enrollments,
+            "performed_by": actor_id,
+            "performed_at": now.isoformat(),
+        }
+
+    
+    @staticmethod
+    async def quote_student_course_checkout(
+        body: PrepareStudentCheckoutBody,
+        current_user: dict,
+    ):
+        """Return student checkout amount with admission-fee rules, without creating enrollment."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        student_id = current_user["id"]
+        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
+        br = (body.batch_ref or "").strip() or None
+        beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
+        should_charge_admission = await should_charge_admission_fee_for_checkout(
+            db,
+            student_id=student_id,
+            beneficiary=beneficiary_payload,
+        )
+        info = await PaymentController.get_course_payment_info(
+            body.course_id,
+            body.branch_id,
+            body.duration,
+            batch_ref=br,
+            optional_student_id=student_id,
+            admission_fee_beneficiary=beneficiary_payload,
+        )
+        course_fee = float(info.pricing.course_fee)
+        effective_admission_fee = float(info.pricing.admission_fee)
+        total_amount = float(info.pricing.total_amount)
+
+        return {
+            "course_id": body.course_id,
+            "branch_id": body.branch_id,
+            "duration": body.duration,
+            "batch_ref": br,
+            "course_name": info.course_name,
+            "branch_name": info.branch_name,
+            "pricing": {
+                "course_fee": course_fee,
+                "admission_fee": effective_admission_fee,
+                "total_amount": total_amount,
+                "currency": "INR",
+            },
+            "admission_fee_applied": should_charge_admission,
+        }
+
     @staticmethod
     async def student_process_payment(
         payment_data: StudentPaymentCreate,
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
         """Allow a student to process a payment for their enrollment."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
         student_id = current_user["id"]
 
         # Validate enrollment and payment
@@ -141,57 +717,451 @@ class PaymentController:
         data: ConfirmRazorpayPayment,
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
-        """Record a Razorpay payment and update enrollment (payment_status, end_date if renewal)."""
+        """Verify/record Razorpay payment and activate linked enrollment."""
         db = get_db()
         if db is None:
             raise HTTPException(status_code=500, detail="Database connection not available")
         student_id = current_user["id"]
 
-        enrollment = await db.enrollments.find_one({
-            "id": data.enrollment_id,
-            "student_id": student_id,
-        })
+        if data.razorpay_order_id:
+            if not data.razorpay_signature:
+                raise HTTPException(status_code=400, detail="Missing Razorpay signature")
+            if not verify_razorpay_signature(
+                data.razorpay_order_id, data.razorpay_payment_id, data.razorpay_signature
+            ):
+                raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+        # Prefer order linkage when present; fallback to requested enrollment_id.
+        enrollment = None
+        if data.razorpay_order_id:
+            enrollment = await db.enrollments.find_one(
+                {"student_id": student_id, "razorpay_last_order_id": data.razorpay_order_id}
+            )
+        if enrollment is None:
+            enrollment = await db.enrollments.find_one(
+                {"id": data.enrollment_id, "student_id": student_id}
+            )
         if not enrollment:
-            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
+            raise HTTPException(
+                status_code=404,
+                detail="Enrollment not found for this payment. Please refresh and try again.",
+            )
+
+        expected_total_inr = _enrollment_checkout_total_inr(enrollment)
+        if expected_total_inr <= 0:
+            raise HTTPException(status_code=400, detail="Invalid enrollment amount.")
 
         now = datetime.utcnow()
         due_date = now + timedelta(days=30)
 
+        course_name = data.course_name
+        if not course_name and enrollment.get("course_id"):
+            crs = await db.courses.find_one({"id": enrollment["course_id"]})
+            if crs:
+                course_name = crs.get("title") or crs.get("name")
+
+        pm_value = PaymentMethod.DIGITAL_WALLET.value
+        gw_raw = "razorpay"
+        gw_label = "Razorpay"
+        rz = _fetch_razorpay_payment_entity(data.razorpay_payment_id)
+        if rz:
+            pm_value, gw_raw, gw_label = _razorpay_method_to_payment_fields(rz)
+            if data.razorpay_order_id:
+                rz_amount = rz.get("amount")
+                if rz_amount is not None:
+                    expected_paise = int(round(expected_total_inr * 100))
+                    if int(rz_amount) != expected_paise:
+                        logger.error(
+                            "Razorpay captured amount mismatch enrollment=%s expected_paise=%s payment_amount=%s",
+                            data.enrollment_id,
+                            expected_paise,
+                            rz_amount,
+                        )
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Payment amount does not match enrollment. Please contact support.",
+                        )
+
+        # Idempotency: if this Razorpay payment is already recorded, just ensure enrollment is active/paid.
+        existing_paid = await db.payments.find_one(
+            {"student_id": student_id, "transaction_id": data.razorpay_payment_id}
+        )
+        if existing_paid:
+            # Ensure stale pending attempts for this enrollment do not keep showing as pending.
+            await db.payments.update_many(
+                {
+                    "student_id": student_id,
+                    "enrollment_id": enrollment["id"],
+                    "payment_status": {"$in": [PaymentStatus.PENDING.value, "processing", "failed"]},
+                },
+                {
+                    "$set": {
+                        "payment_status": "cancelled",
+                        "status": "cancelled",
+                        "updated_at": now,
+                        "notes": "Auto-cancelled after payment verification",
+                    }
+                },
+            )
+            paid_patch = {
+                "payment_status": PaymentStatus.PAID.value,
+                "is_active": True,
+                "updated_at": now,
+            }
+            recomputed = await enrollment_subscription_end_after_payment(db, enrollment)
+            if recomputed:
+                paid_patch["end_date"] = recomputed
+            await db.enrollments.update_one(
+                {"id": enrollment["id"]},
+                {"$set": paid_patch, "$unset": {"status": ""}},
+            )
+            return {
+                "message": "Payment already verified",
+                "payment_id": existing_paid.get("id") or str(existing_paid.get("_id")),
+            }
+
         payment_doc = {
             "id": str(uuid.uuid4()),
+            "user_id": student_id,  # alias for reporting compatibility
             "student_id": student_id,
-            "enrollment_id": data.enrollment_id,
-            "amount": data.amount,
+            "enrollment_id": enrollment["id"],
+            "course_id": enrollment.get("course_id"),
+            "amount": expected_total_inr,
             "payment_type": PaymentType.COURSE_FEE.value,
-            "payment_method": PaymentMethod.DIGITAL_WALLET.value,
+            "payment_method": pm_value,
+            "gateway_method": gw_raw,
+            "gateway_payment_label": gw_label,
+            "status": "success",
             "payment_status": PaymentStatus.PAID.value,
             "transaction_id": data.razorpay_payment_id,
+            "razorpay_payment_id": data.razorpay_payment_id,
+            "razorpay_order_id": data.razorpay_order_id,
             "payment_date": now,
             "due_date": due_date,
             "notes": f"Razorpay order: {data.razorpay_order_id or 'N/A'}",
-            "course_details": {"course_name": data.course_name} if data.course_name else None,
+            "course_details": {"course_name": course_name} if course_name else None,
             "branch_details": {"branch_name": data.branch_name} if data.branch_name else None,
             "created_at": now,
             "updated_at": now,
         }
+        # Update pending row created at order time when available; otherwise insert paid row.
+        pending_filter = {
+            "student_id": student_id,
+            "enrollment_id": enrollment["id"],
+            "payment_status": PaymentStatus.PENDING.value,
+            "razorpay_order_id": data.razorpay_order_id,
+        }
+        if data.razorpay_order_id:
+            upd = await db.payments.update_one(
+                pending_filter,
+                {"$set": payment_doc},
+            )
+            if upd.matched_count == 0:
+                await db.payments.insert_one(payment_doc)
+        else:
+            await db.payments.insert_one(payment_doc)
 
-        await db.payments.insert_one(payment_doc)
+        update_enrollment = {
+            "payment_status": PaymentStatus.PAID.value,
+            "is_active": True,
+            "updated_at": now,
+        }
+        recomputed_end = await enrollment_subscription_end_after_payment(db, enrollment)
+        if recomputed_end:
+            update_enrollment["end_date"] = recomputed_end
 
-        update_enrollment = {"payment_status": PaymentStatus.PAID.value, "updated_at": now}
-        if data.duration_months and enrollment.get("end_date"):
-            try:
-                end = enrollment["end_date"]
-                new_end = end + timedelta(days=30 * data.duration_months)
-                update_enrollment["end_date"] = new_end
-            except Exception:
-                pass
+        enr_upd = await db.enrollments.update_one(
+            {"id": enrollment["id"]},
+            {"$set": update_enrollment, "$unset": {"status": ""}},
+        )
+        if enr_upd.matched_count == 0:
+            raise HTTPException(status_code=500, detail="Failed to activate enrollment after payment.")
 
-        await db.enrollments.update_one(
-            {"id": data.enrollment_id},
-            {"$set": update_enrollment},
+        # Mark any sibling pending attempts for the same enrollment as cancelled.
+        await db.payments.update_many(
+            {
+                "student_id": student_id,
+                "enrollment_id": enrollment["id"],
+                "id": {"$ne": payment_doc["id"]},
+                "payment_status": {"$in": [PaymentStatus.PENDING.value, "processing", "failed"]},
+            },
+            {
+                "$set": {
+                    "payment_status": "cancelled",
+                    "status": "cancelled",
+                    "updated_at": now,
+                    "notes": "Auto-cancelled duplicate attempt after successful payment",
+                }
+            },
         )
 
         return {"message": "Payment recorded successfully", "payment_id": payment_doc["id"]}
+
+    @staticmethod
+    async def create_student_razorpay_order(
+        body: CreateStudentRazorpayOrderBody,
+        current_user: dict,
+    ):
+        """Create a real Razorpay order for a pending enrollment; amount is derived server-side (INR → paise)."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        student_id = current_user["id"]
+        enrollment = await db.enrollments.find_one(
+            {"id": body.enrollment_id, "student_id": student_id}
+        )
+        if not enrollment:
+            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
+
+        raw_ps = enrollment.get("payment_status")
+        if hasattr(raw_ps, "value"):
+            ps = str(raw_ps.value).lower()
+        else:
+            ps = str(raw_ps or "").lower()
+        if ps != EnrollmentPaymentStatus.PENDING.value:
+            raise HTTPException(
+                status_code=400,
+                detail="Checkout is only available for pending enrollments. Refresh and try again.",
+            )
+
+        total_inr = _enrollment_checkout_total_inr(enrollment)
+        if total_inr <= 0:
+            raise HTTPException(status_code=400, detail="Invalid checkout amount.")
+
+        amount_paise = int(round(total_inr * 100))
+        if amount_paise < 100:
+            raise HTTPException(status_code=400, detail="Amount too small for online payment.")
+
+        logger.info(
+            "Razorpay order.create (student enrollment) enrollment_id=%s amount_paise=%s amount_inr=%s",
+            body.enrollment_id,
+            amount_paise,
+            total_inr,
+        )
+
+        client = get_razorpay_client()
+        try:
+            order = client.order.create(
+                {
+                    "amount": amount_paise,
+                    "currency": "INR",
+                    "payment_capture": 1,
+                    "notes": {
+                        "enrollment_id": (body.enrollment_id or "")[:40],
+                        "student_id": (student_id or "")[:40],
+                    },
+                }
+            )
+        except Exception:
+            logger.exception("Razorpay order.create failed enrollment_id=%s", body.enrollment_id)
+            raise HTTPException(
+                status_code=502,
+                detail="We could not reach the payment service. Please try again in a moment.",
+            )
+
+        now = datetime.utcnow()
+        await db.enrollments.update_one(
+            {"id": body.enrollment_id},
+            {"$set": {"razorpay_last_order_id": order["id"], "updated_at": now}},
+        )
+
+        # Cancel any previous pending payment rows for this enrollment (from earlier abandoned attempts).
+        await db.payments.update_many(
+            {
+                "student_id": student_id,
+                "enrollment_id": body.enrollment_id,
+                "payment_status": PaymentStatus.PENDING.value,
+                "razorpay_order_id": {"$ne": order["id"]},
+            },
+            {
+                "$set": {
+                    "payment_status": "cancelled",
+                    "status": "cancelled",
+                    "updated_at": now,
+                    "notes": "Auto-cancelled: superseded by new payment order",
+                }
+            },
+        )
+
+        # Create pending payment row linked to enrollment/order (verify step will mark paid/success).
+        existing_order_payment = await db.payments.find_one(
+            {"student_id": student_id, "enrollment_id": body.enrollment_id, "razorpay_order_id": order["id"]}
+        )
+        if not existing_order_payment:
+            pending_doc = {
+                "id": str(uuid.uuid4()),
+                "user_id": student_id,
+                "student_id": student_id,
+                "enrollment_id": body.enrollment_id,
+                "course_id": enrollment.get("course_id"),
+                "amount": total_inr,
+                "payment_type": PaymentType.COURSE_FEE.value,
+                "payment_method": PaymentMethod.DIGITAL_WALLET.value,
+                "payment_status": PaymentStatus.PENDING.value,
+                "status": "initiated",
+                "transaction_id": None,
+                "razorpay_payment_id": None,
+                "razorpay_order_id": order["id"],
+                "payment_date": None,
+                "due_date": now + timedelta(days=30),
+                "notes": f"Razorpay order created: {order['id']}",
+                "created_at": now,
+                "updated_at": now,
+            }
+            await db.payments.insert_one(pending_doc)
+
+        key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+        return {
+            "order": {
+                "id": order["id"],
+                "amount": int(order["amount"]),
+                "currency": str(order.get("currency") or "INR"),
+            },
+            "key": key_id,
+        }
+
+    @staticmethod
+    async def prepare_student_course_checkout(
+        body: PrepareStudentCheckoutBody,
+        current_user: dict,
+    ):
+        """Create a pending enrollment using the same pricing as payment-info; client then pays via Razorpay."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        student_id = current_user["id"]
+        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
+
+        active_paid = await db.enrollments.find_one(
+            {
+                "student_id": student_id,
+                "course_id": body.course_id,
+                "is_active": True,
+                "payment_status": EnrollmentPaymentStatus.PAID.value,
+            }
+        )
+
+        # Drop abandoned pending checkouts so the student can retry after canceling Razorpay.
+        # Also cancel pending payment attempts linked to those stale pending enrollments.
+        stale_pending_enrollments = await db.enrollments.find(
+            {
+                "student_id": student_id,
+                "course_id": body.course_id,
+                "payment_status": EnrollmentPaymentStatus.PENDING.value,
+            },
+            {"id": 1},
+        ).to_list(length=None)
+        stale_pending_enrollment_ids = [str(e.get("id")) for e in stale_pending_enrollments if e.get("id")]
+
+        if stale_pending_enrollment_ids:
+            await db.payments.update_many(
+                {
+                    "student_id": student_id,
+                    "enrollment_id": {"$in": stale_pending_enrollment_ids},
+                    "payment_status": {"$in": [PaymentStatus.PENDING.value, "processing", "failed"]},
+                },
+                {
+                    "$set": {
+                        "payment_status": "cancelled",
+                        "status": "cancelled",
+                        "updated_at": datetime.utcnow(),
+                        "notes": "Auto-cancelled stale checkout attempt before new checkout",
+                    }
+                },
+            )
+
+        await db.enrollments.delete_many(
+            {
+                "student_id": student_id,
+                "course_id": body.course_id,
+                "payment_status": EnrollmentPaymentStatus.PENDING.value,
+            }
+        )
+
+        branch = await db.branches.find_one({"id": body.branch_id})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+
+        batch_ref = (body.batch_ref or "").strip() or None
+
+        beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
+        info = await PaymentController.get_course_payment_info(
+            body.course_id,
+            body.branch_id,
+            body.duration,
+            batch_ref=batch_ref,
+            optional_student_id=student_id,
+            admission_fee_beneficiary=beneficiary_payload,
+        )
+
+        start_date = datetime.utcnow()
+        if active_paid and not is_subscription_period_over(active_paid.get("end_date")):
+            # Allow in-advance renewal while preserving current plan validity window.
+            active_end_eod = subscription_end_of_day_utc(active_paid.get("end_date"))
+            if active_end_eod is not None:
+                start_date = (active_end_eod + timedelta(microseconds=1)).replace(tzinfo=None)
+        duration_row = await db.durations.find_one({"id": body.duration})
+        if not duration_row:
+            duration_row = await db.durations.find_one({"code": body.duration})
+        months_hint = None
+        if duration_row and duration_row.get("duration_months") is not None:
+            try:
+                months_hint = int(duration_row["duration_months"])
+            except (TypeError, ValueError):
+                months_hint = None
+
+        end_date = await resolve_enrollment_end_date(
+            db, body.duration, start_date, months_hint=months_hint
+        )
+
+        effective_admission_fee = float(info.pricing.admission_fee)
+        effective_total = float(info.pricing.total_amount)
+
+        enrollment = EnrollmentModel(
+            student_id=student_id,
+            course_id=body.course_id,
+            branch_id=body.branch_id,
+            start_date=start_date,
+            end_date=end_date,
+            fee_amount=float(info.pricing.course_fee),
+            admission_fee=effective_admission_fee,
+            payment_status=EnrollmentPaymentStatus.PENDING,
+            is_active=True,
+        )
+        enrollment_doc = enrollment.dict()
+        enrollment_doc["duration_id"] = body.duration
+        enrollment_doc["enrollment_date"] = start_date
+        # Store beneficiary info if provided
+        if body.beneficiary and body.beneficiary.beneficiary_type != "self":
+            enrollment_doc["beneficiary"] = beneficiary_payload
+        await db.enrollments.insert_one(enrollment_doc)
+
+        return {
+            "enrollment_id": enrollment.id,
+            "amount": effective_total,
+            "course_name": info.course_name,
+            "branch_name": info.branch_name,
+            "duration_months": months_hint,
+        }
+
+    @staticmethod
+    async def _duration_ref_for_months(db, months: int) -> Optional[str]:
+        """Resolve duration document id/code for a canonical tenure length (e.g. 1 month)."""
+        if months <= 0:
+            return None
+        row = await db.durations.find_one({"duration_months": months, "is_active": True})
+        if not row:
+            row = await db.durations.find_one({"duration_months": months})
+        if not row:
+            return None
+        rid = row.get("id") or row.get("code")
+        return str(rid) if rid is not None else None
 
     @staticmethod
     async def get_course_payment_info(
@@ -199,8 +1169,15 @@ class PaymentController:
         branch_id: str,
         duration: str,
         batch_ref: Optional[str] = None,
+        optional_student_id: Optional[str] = None,
+        admission_fee_beneficiary: Optional[dict] = None,
     ):
-        """Get payment information for a course"""
+        """Get payment information for a course.
+
+        When ``optional_student_id`` is set (logged-in student), branch admission is included only if
+        this is their first completed enrollment (self) or first for that beneficiary — otherwise
+        admission fee is omitted from totals.
+        """
         try:
             db = get_db()
 
@@ -226,11 +1203,28 @@ class PaymentController:
             if not duration_info:
                 duration_info = await db.durations.find_one({"code": duration})
 
-            pricing_multiplier = duration_info.get("pricing_multiplier", 1.0) if duration_info else 1.0
+            pricing_multiplier = 1.0
+            months_int = 0
+            if duration_info:
+                try:
+                    pm = float(duration_info.get("pricing_multiplier", 1.0))
+                except (TypeError, ValueError):
+                    pm = 1.0
+                dm = duration_info.get("duration_months")
+                try:
+                    months_int = int(dm) if dm is not None else 0
+                except (TypeError, ValueError):
+                    months_int = 0
+                # Master data often stores multiplier as 1 for every tenure; scale by month count
+                # so base/month fee * tenure length (unless an explicit non-1 multiplier was set).
+                if pm == 1.0 and months_int > 0:
+                    pricing_multiplier = float(months_int)
+                else:
+                    pricing_multiplier = pm
             duration_name = duration_info.get("name", duration) if duration_info else duration
 
-            # Public registration: branch-specific admission_fee when present (matches admin "Admission Fee (Branch Specific)");
-            # otherwise fall back to Super Admin system_settings registration_fee (default 500).
+            # Admission is always the configured branch/system amount for this checkout — never multiplied by duration.
+            # (Course tuition may scale by tenure via batch/monthly pricing or linear multi-month estimate.)
             admission_fee = await SettingsController.get_default_registration_fee()
             branch_adm = branch.get("admission_fee")
             if branch_adm is not None:
@@ -240,10 +1234,15 @@ class PaymentController:
                     pass
             course_fee = None
             total_amount = None
+            batch_is_flat = False
+            explicit_duration_fee_found = False
 
             dur_keys = _duration_price_keys(duration, duration_info)
 
             batches = _batches_for_course_on_branch(branch, course_id)
+            branch_pricing = _course_branch_pricing_map(course)
+            # Batch pricing applies only when the client selects a batch (registration batch picker).
+            # Renewals and quotes without batch_ref use course/branch tenure fees (e.g. ₹1500 not first batch ₹3000).
             if batch_ref and str(batch_ref).strip():
                 bdoc = _resolve_branch_batch(batches, batch_ref)
                 if bdoc is None:
@@ -251,14 +1250,67 @@ class PaymentController:
                         status_code=400,
                         detail="Invalid batch selection for this course at the selected branch.",
                     )
-                bf = _batch_fee_from_doc(bdoc)
-                if bf is not None:
-                    course_fee = bf
+                # Check batch fee_per_duration first (per-duration pricing)
+                batch_fpd = bdoc.get("fee_per_duration") or {}
+                batch_ptd = bdoc.get("pricing_type_per_duration") or {}
+                batch_dur_fee = None
+                # Default matches course-level fee_per_duration: each tier cell is the full package price
+                # for that tenure. Use pricing_type_per_duration[key] == "monthly" only when the cell is a
+                # per-month rupee amount (multiply by duration_months).
+                batch_dur_pricing_type = "flat"
+                matched_dur_key = None
+                if isinstance(batch_fpd, dict):
+                    for dk in dur_keys:
+                        if dk in batch_fpd and batch_fpd[dk] is not None:
+                            try:
+                                batch_dur_fee = float(batch_fpd[dk])
+                                matched_dur_key = dk
+                            except (TypeError, ValueError):
+                                pass
+                            if batch_dur_fee is not None:
+                                break
+                if matched_dur_key and isinstance(batch_ptd, dict):
+                    pt_raw = batch_ptd.get(matched_dur_key)
+                    if pt_raw is not None and str(pt_raw).strip():
+                        batch_dur_pricing_type = str(pt_raw).strip().lower()
+                if batch_dur_fee is not None:
+                    explicit_duration_fee_found = True
+                    if batch_dur_pricing_type == "monthly":
+                        course_fee = batch_dur_fee * pricing_multiplier
+                        batch_is_flat = False
+                    else:
+                        # Package total for this duration (flat / unset / any non-monthly label)
+                        course_fee = batch_dur_fee
+                        batch_is_flat = batch_dur_pricing_type == "flat"
                     total_amount = course_fee + admission_fee
-                    pricing_multiplier = 1.0
+                else:
+                    bf = _batch_fee_from_doc(bdoc)
+                    if bf is not None:
+                        # Legacy batch_fee is per-month; multiply by tenure months
+                        course_fee = bf * pricing_multiplier
+                        total_amount = course_fee + admission_fee
+
+            # 0) Flat/offer price check — overrides all calculated pricing
+            flat_price_per_duration = course.get("flat_price_per_duration") or {}
+            if isinstance(course.get("pricing"), dict):
+                flat_price_per_duration = flat_price_per_duration or course["pricing"].get("flat_price_per_duration") or {}
+            flat_price_value = None
+            original_calculated_total = None
+            for dk in dur_keys:
+                if dk in flat_price_per_duration and flat_price_per_duration[dk] is not None:
+                    flat_price_value = float(flat_price_per_duration[dk])
+                    break
+            # Also check branch-specific flat prices
+            branch_flat_prices = {}
+            raw_bp = course.get("branch_pricing") or {}
+            if branch_id in raw_bp and isinstance(raw_bp[branch_id], dict):
+                branch_flat_prices = raw_bp[branch_id].get("flat_price_per_duration") or {}
+            for dk in dur_keys:
+                if dk in branch_flat_prices and branch_flat_prices[dk] is not None:
+                    flat_price_value = float(branch_flat_prices[dk])
+                    break
 
             # 1) Branch-specific duration fees (dict may use duration id, code, or slug)
-            branch_pricing = course.get("branch_pricing") or {}
             bp_val = None
             if total_amount is None and branch_id in branch_pricing:
                 bp_val = branch_pricing[branch_id]
@@ -272,6 +1324,7 @@ class PaymentController:
                         course_fee = picked
                         total_amount = course_fee + admission_fee
                         pricing_multiplier = 1.0
+                        explicit_duration_fee_found = True
                     # dict but no matching key: fall through to fee_per_duration / legacy (no 404)
                 elif isinstance(bp_val, (int, float)):
                     base_price = float(bp_val)
@@ -282,7 +1335,7 @@ class PaymentController:
 
             if total_amount is None:
                 # 2) Default fee_per_duration
-                fee_per_duration = course.get("fee_per_duration") or {}
+                fee_per_duration = _course_fee_per_duration_map(course)
                 picked_fd = None
                 for dk in dur_keys:
                     if dk in fee_per_duration and fee_per_duration[dk] is not None:
@@ -292,6 +1345,7 @@ class PaymentController:
                     course_fee = picked_fd
                     total_amount = course_fee + admission_fee
                     pricing_multiplier = 1.0
+                    explicit_duration_fee_found = True
                 else:
                     # 3) Legacy: base_fee * multiplier (even if maps exist but lack this tenure)
                     base_price = course.get("base_fee")
@@ -305,7 +1359,10 @@ class PaymentController:
                         if base_price is None:
                             base_price = course.get("price") or course.get("fee")
                     if base_price is None:
-                        base_price = 15000
+                        raise HTTPException(
+                            status_code=400,
+                            detail="No pricing configured for this course. Please contact the admin to set up pricing.",
+                        )
                     base_price = float(base_price)
                     if branch_id in branch_pricing and isinstance(branch_pricing[branch_id], (int, float)):
                         base_price = float(branch_pricing[branch_id])
@@ -315,13 +1372,73 @@ class PaymentController:
             # Import PaymentCalculation
             from models.student_models import PaymentCalculation
 
+            # If flat price applies, use it and track the discount
+            is_flat_price = batch_is_flat
+            if flat_price_value is not None and total_amount is not None:
+                original_calculated_total = total_amount
+                course_fee = flat_price_value
+                total_amount = flat_price_value + admission_fee
+                is_flat_price = True
+
+            # Multi-month estimate = same rules as 1-month × tenure months (matches registration UX).
+            # Skip when an explicit flat-price campaign applies (admin-set package for that tenure).
+            scale_months = (
+                months_int
+                if months_int > 1
+                else int(pricing_multiplier)
+                if pricing_multiplier > 1
+                else 1
+            )
+            applied_linear_tenure_scale = False
+            if flat_price_value is None and not explicit_duration_fee_found and scale_months > 1:
+                one_ref = await PaymentController._duration_ref_for_months(db, 1)
+                if one_ref and str(one_ref) != str(duration):
+                    try:
+                        base_info = await PaymentController.get_course_payment_info(
+                            course_id,
+                            branch_id,
+                            str(one_ref),
+                            batch_ref=batch_ref,
+                            optional_student_id=optional_student_id,
+                            admission_fee_beneficiary=admission_fee_beneficiary,
+                        )
+                        bp = base_info.pricing
+                        base_total = float(bp.total_amount or 0)
+                        if base_total > 0:
+                            sf = float(scale_months)
+                            course_fee = round(float(bp.course_fee or 0) * sf, 2)
+                            # Admission is branch/setup-defined once; never scaled by tenure.
+                            admission_fee = round(float(bp.admission_fee or 0), 2)
+                            total_amount = round(course_fee + admission_fee, 2)
+                            pricing_multiplier = sf
+                            applied_linear_tenure_scale = True
+                    except HTTPException:
+                        pass
+
+            if applied_linear_tenure_scale:
+                is_flat_price = False
+                original_calculated_total = None
+
+            # Logged-in students: admission only on first successful payment (never on renewals).
+            if optional_student_id:
+                ben = admission_fee_beneficiary if admission_fee_beneficiary is not None else {"beneficiary_type": "self"}
+                charge_admission = await should_charge_admission_fee_for_checkout(
+                    db, optional_student_id, ben
+                )
+                if not charge_admission:
+                    admission_fee = 0.0
+                    total_amount = round(float(course_fee or 0), 2)
+
             # Create pricing calculation
             pricing = PaymentCalculation(
                 course_fee=course_fee,
                 admission_fee=admission_fee,
                 total_amount=total_amount,
                 currency="INR",
-                duration_multiplier=pricing_multiplier
+                duration_multiplier=pricing_multiplier,
+                original_price=original_calculated_total if is_flat_price else None,
+                discount_amount=round(original_calculated_total - total_amount, 2) if is_flat_price and original_calculated_total else None,
+                is_flat_price=is_flat_price,
             )
 
             return CoursePaymentInfo(
@@ -572,19 +1689,182 @@ class PaymentController:
         if not start_date or not end_date:
             return None, None
         try:
-            s = datetime.strptime(start_date[:10], "%Y-%m-%d")
-            e = datetime.strptime(end_date[:10], "%Y-%m-%d").replace(
+            s = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+            e = datetime.strptime(str(end_date)[:10], "%Y-%m-%d").replace(
                 hour=23, minute=59, second=59, microsecond=999999
             )
+            if s > e:
+                s, e = e, s
             return s, e
-        except ValueError:
+        except (ValueError, TypeError):
             return None, None
+
+    @staticmethod
+    def _merge_collected_revenue_filters(base: dict) -> dict:
+        """
+        Successful collections only (excludes pending/processing/cancelled/refunded).
+        Uses payment_status and legacy top-level status used by some gateways.
+        """
+        conj = [
+            {"payment_status": {"$nin": ["cancelled", "canceled", "failed", "refunded", "pending", "processing"]}},
+            {
+                "$or": [
+                    {"payment_status": {"$in": [PaymentStatus.PAID.value, "completed", "success", "captured"]}},
+                    {"status": {"$in": ["success", "completed"]}},
+                ]
+            },
+        ]
+        out = dict(base or {})
+        if "$and" in out:
+            out["$and"] = list(out["$and"]) + conj
+        else:
+            out["$and"] = conj
+        return out
+
+    @staticmethod
+    def _pipeline_add_net_revenue_inr():
+        """Prepare gross INR minus Razorpay refunds (partial refunds reduce net)."""
+        return [
+            {
+                "$addFields": {
+                    "_gross_inr": {
+                        "$convert": {"input": "$amount", "to": "double", "onError": 0.0, "onNull": 0.0}
+                    },
+                    "_refund_inr": {
+                        "$divide": [
+                            {
+                                "$convert": {
+                                    "input": {"$ifNull": ["$razorpay_refunded_amount_paise", 0]},
+                                    "to": "double",
+                                    "onError": 0.0,
+                                }
+                            },
+                            100.0,
+                        ]
+                    },
+                }
+            },
+            {
+                "$addFields": {
+                    "_net_inr": {"$max": [0.0, {"$subtract": ["$_gross_inr", "$_refund_inr"]}]},
+                }
+            },
+        ]
+
+    @staticmethod
+    async def get_revenue_by_branch(
+        current_user: dict,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        branch_id: Optional[str] = None,
+    ):
+        """
+        Branch-wise revenue from payments for a given period.
+        Uses payment_date when available, else created_at.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
+        match: dict = PaymentController._merge_collected_revenue_filters({})
+        if ps and pe:
+            match["$or"] = [
+                {"payment_date": {"$gte": ps, "$lte": pe}},
+                {
+                    "payment_date": {"$exists": False},
+                    "created_at": {"$gte": ps, "$lte": pe},
+                },
+                {
+                    "payment_date": None,
+                    "created_at": {"$gte": ps, "$lte": pe},
+                },
+            ]
+
+        # Branch id can be on payment.branch_details.branch_id, or derived from enrollment.branch_id.
+        pipeline = [
+            {"$match": match},
+            {
+                "$lookup": {
+                    "from": "enrollments",
+                    "localField": "enrollment_id",
+                    "foreignField": "id",
+                    "as": "enr",
+                }
+            },
+            {"$unwind": {"path": "$enr", "preserveNullAndEmptyArrays": True}},
+            {
+                "$addFields": {
+                    "resolved_branch_id": {
+                        "$ifNull": ["$branch_details.branch_id", "$enr.branch_id"]
+                    },
+                    "resolved_branch_name": {
+                        "$ifNull": ["$branch_details.branch_name", None]
+                    },
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "branches",
+                    "localField": "resolved_branch_id",
+                    "foreignField": "id",
+                    "as": "br",
+                }
+            },
+            {"$unwind": {"path": "$br", "preserveNullAndEmptyArrays": True}},
+            {
+                "$addFields": {
+                    "resolved_branch_name": {
+                        "$ifNull": [
+                            "$resolved_branch_name",
+                            {"$ifNull": ["$br.name", "$br.branch.name"]},
+                        ]
+                    }
+                }
+            },
+            *PaymentController._pipeline_add_net_revenue_inr(),
+            {
+                "$group": {
+                    "_id": "$resolved_branch_id",
+                    "branch_name": {"$first": "$resolved_branch_name"},
+                    "total_revenue": {"$sum": "$_net_inr"},
+                    "transactions": {"$sum": 1},
+                }
+            },
+            {"$sort": {"total_revenue": -1}},
+        ]
+
+        rows = await db.payments.aggregate(pipeline).to_list(length=200)
+        # Normalize None branch bucket
+        out = []
+        for r in rows:
+            bid = r.get("_id")
+            out.append(
+                {
+                    "branch_id": bid if bid else "unassigned",
+                    "branch_name": r.get("branch_name") or ("No branch on record" if not bid else "Branch"),
+                    "total_revenue": float(r.get("total_revenue") or 0),
+                    "transactions": int(r.get("transactions") or 0),
+                }
+            )
+
+        if branch_id and branch_id != "all":
+            want = "unassigned" if branch_id == "unassigned" else branch_id
+            out = [r for r in out if r.get("branch_id") == want]
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "branches": out,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
 
     @staticmethod
     async def get_payment_stats(
         current_user: dict = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        branch_id: Optional[str] = None,
     ):
         """Get payment statistics for dashboard"""
         db = get_db()
@@ -665,38 +1945,92 @@ class PaymentController:
                 # Filter by branch_id in branch_details
                 base_filter["branch_details.branch_id"] = assigned_branch
 
-        # Get total collected (paid payments)
-        total_collected_pipeline = [
-            {"$match": {**base_filter, "payment_status": PaymentStatus.PAID.value}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]
-        total_collected_result = await db.payments.aggregate(total_collected_pipeline).to_list(1)
-        total_collected = total_collected_result[0]["total"] if total_collected_result else 0
+        # Optional superadmin branch filter (do not affect other roles)
+        branch_filter = None
+        if current_user:
+            r = str(current_user.get("role") or "").lower()
+            is_super = r in ["super_admin", "superadmin"]
+            if is_super and branch_id and branch_id != "all":
+                branch_filter = branch_id
 
-        # Get pending payments
-        pending_payments_pipeline = [
-            {"$match": {**base_filter, "payment_status": PaymentStatus.PENDING.value}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+        # Build a robust match that:
+        # - uses payment_date when present
+        # - falls back to created_at when payment_date is missing/null
+        period_start, period_end = PaymentController._payment_stats_parse_period(start_date, end_date)
+
+        all_time_match_base: dict = {**base_filter}
+        period_match_base: dict = {**base_filter}
+        if period_start and period_end:
+            period_match_base["$or"] = [
+                {"payment_date": {"$gte": period_start, "$lte": period_end}},
+                {"payment_date": {"$exists": False}, "created_at": {"$gte": period_start, "$lte": period_end}},
+                {"payment_date": None, "created_at": {"$gte": period_start, "$lte": period_end}},
+            ]
+
+        # If branch_filter is requested, resolve branch via payment.branch_details OR enrollment.branch_id
+        # using an aggregation pipeline (keeps totals consistent with branch-wise revenue endpoint).
+        def _branch_resolution_pipeline(extra_match: dict):
+            pipeline = [
+                {"$match": extra_match},
+                {
+                    "$lookup": {
+                        "from": "enrollments",
+                        "localField": "enrollment_id",
+                        "foreignField": "id",
+                        "as": "enr",
+                    }
+                },
+                {"$unwind": {"path": "$enr", "preserveNullAndEmptyArrays": True}},
+                {
+                    "$addFields": {
+                        "resolved_branch_id": {"$ifNull": ["$branch_details.branch_id", "$enr.branch_id"]}
+                    }
+                },
+            ]
+            if branch_filter:
+                want = None if branch_filter == "unassigned" else branch_filter
+                pipeline.append(
+                    {"$match": {"resolved_branch_id": want}}
+                )
+            return pipeline
+
+        # total collected (ALL TIME; should not change with date filters) — net of Razorpay refunds
+        total_match = PaymentController._merge_collected_revenue_filters(all_time_match_base)
+        total_pipeline = (
+            _branch_resolution_pipeline(total_match)
+            + PaymentController._pipeline_add_net_revenue_inr()
+            + [{"$group": {"_id": None, "total": {"$sum": "$_net_inr"}}}]
+        )
+        total_collected_result = await db.payments.aggregate(total_pipeline).to_list(1)
+        total_collected = float(total_collected_result[0]["total"]) if total_collected_result else 0.0
+
+        # pending payments (ALL TIME; should not change with date filters)
+        pending_match = {**all_time_match_base, "payment_status": PaymentStatus.PENDING.value}
+        pending_pipeline = _branch_resolution_pipeline(pending_match) + [
+            {
+                "$group": {
+                    "_id": None,
+                    "total": {
+                        "$sum": {
+                            "$convert": {"input": "$amount", "to": "double", "onError": 0.0, "onNull": 0.0}
+                        }
+                    },
+                }
+            }
         ]
-        pending_payments_result = await db.payments.aggregate(pending_payments_pipeline).to_list(1)
-        pending_payments = pending_payments_result[0]["total"] if pending_payments_result else 0
+        pending_payments_result = await db.payments.aggregate(pending_pipeline).to_list(1)
+        pending_payments = float(pending_payments_result[0]["total"]) if pending_payments_result else 0.0
 
         # Period collection (matches dashboard date filter) vs calendar month fallback
-        period_start, period_end = PaymentController._payment_stats_parse_period(
-            start_date, end_date
-        )
         if period_start and period_end:
-            period_match = {
-                **base_filter,
-                "payment_status": PaymentStatus.PAID.value,
-                "payment_date": {"$gte": period_start, "$lte": period_end},
-            }
-            period_pipeline = [
-                {"$match": period_match},
-                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}},
-            ]
+            period_match = PaymentController._merge_collected_revenue_filters(period_match_base)
+            period_pipeline = (
+                _branch_resolution_pipeline(period_match)
+                + PaymentController._pipeline_add_net_revenue_inr()
+                + [{"$group": {"_id": None, "total": {"$sum": "$_net_inr"}, "cnt": {"$sum": 1}}}]
+            )
             period_result = await db.payments.aggregate(period_pipeline).to_list(1)
-            this_month_collection = period_result[0]["total"] if period_result else 0
+            this_month_collection = float(period_result[0]["total"]) if period_result else 0.0
             period_payment_count = int(period_result[0]["cnt"]) if period_result else 0
             distinct_students = await db.payments.distinct(
                 "student_id",
@@ -707,18 +2041,23 @@ class PaymentController:
             current_month_start = datetime.utcnow().replace(
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
-            this_month_pipeline = [
+            month_match = PaymentController._merge_collected_revenue_filters(
                 {
-                    "$match": {
-                        **base_filter,
-                        "payment_status": PaymentStatus.PAID.value,
-                        "payment_date": {"$gte": current_month_start},
-                    }
-                },
-                {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}},
-            ]
+                    **base_filter,
+                    "$or": [
+                        {"payment_date": {"$gte": current_month_start}},
+                        {"payment_date": {"$exists": False}, "created_at": {"$gte": current_month_start}},
+                        {"payment_date": None, "created_at": {"$gte": current_month_start}},
+                    ],
+                }
+            )
+            this_month_pipeline = (
+                _branch_resolution_pipeline(month_match)
+                + PaymentController._pipeline_add_net_revenue_inr()
+                + [{"$group": {"_id": None, "total": {"$sum": "$_net_inr"}, "cnt": {"$sum": 1}}}]
+            )
             this_month_result = await db.payments.aggregate(this_month_pipeline).to_list(1)
-            this_month_collection = this_month_result[0]["total"] if this_month_result else 0
+            this_month_collection = float(this_month_result[0]["total"]) if this_month_result else 0.0
             period_payment_count = int(this_month_result[0]["cnt"]) if this_month_result else 0
             total_students_period = None
 
@@ -743,6 +2082,7 @@ class PaymentController:
             (this_month_collection / period_payment_count) if period_payment_count else 0
         )
 
+        last_sync = await get_last_reconciled_at(db)
         return {
             "total_collected": total_collected,
             "pending_payments": pending_payments,
@@ -753,6 +2093,7 @@ class PaymentController:
             "monthly_revenue": this_month_collection,
             "payment_count": period_payment_count,
             "average_payment": avg_pay,
+            "last_razorpay_sync_at": last_sync.isoformat() if last_sync else None,
         }
 
     @staticmethod
@@ -764,6 +2105,8 @@ class PaymentController:
         current_user: dict = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        search: Optional[str] = None,
+        branch_id: Optional[str] = None,
     ):
         """Get payments with filtering and student information"""
         try:
@@ -781,7 +2124,68 @@ class PaymentController:
 
             ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
             if ps and pe:
-                filter_query["payment_date"] = {"$gte": ps, "$lte": pe}
+                filter_query["$or"] = [
+                    {"payment_date": {"$gte": ps, "$lte": pe}},
+                    {"payment_date": {"$exists": False}, "created_at": {"$gte": ps, "$lte": pe}},
+                    {"payment_date": None, "created_at": {"$gte": ps, "$lte": pe}},
+                ]
+
+            # Optional branch filter (requested by UI).
+            # For real branch IDs we must resolve from payment.branch_details OR enrollment.branch_id
+            # (some historical rows don't have branch_details populated).
+            branch_filter_id = None
+            if branch_id and branch_id != "all":
+                if branch_id == "unassigned":
+                    filter_query["$and"] = filter_query.get("$and", []) + [
+                        {
+                            "$or": [
+                                {"branch_details.branch_id": {"$exists": False}},
+                                {"branch_details.branch_id": None},
+                                {"branch_details.branch_id": ""},
+                            ]
+                        }
+                    ]
+                else:
+                    branch_filter_id = branch_id
+
+            # Optional search: student name/email/phone + transaction + notes + course/branch names.
+            # Implemented in a backward-compatible way without changing the response structure.
+            if search and str(search).strip():
+                term = str(search).strip()
+                # Find matching students first (so search by name works even though payment docs store student_id).
+                student_ids = []
+                try:
+                    user_q = {
+                        "$or": [
+                            {"full_name": {"$regex": term, "$options": "i"}},
+                            {"first_name": {"$regex": term, "$options": "i"}},
+                            {"last_name": {"$regex": term, "$options": "i"}},
+                            {"email": {"$regex": term, "$options": "i"}},
+                            {"phone": {"$regex": term, "$options": "i"}},
+                        ]
+                    }
+                    users = await db.users.find(user_q, {"id": 1}).limit(50).to_list(length=50)
+                    student_ids = [u.get("id") for u in users if u.get("id")]
+                except Exception:
+                    logger.exception("payment search user lookup failed")
+
+                payment_text_q = {
+                    "$or": [
+                        {"transaction_id": {"$regex": term, "$options": "i"}},
+                        {"razorpay_payment_id": {"$regex": term, "$options": "i"}},
+                        {"razorpay_order_id": {"$regex": term, "$options": "i"}},
+                        {"notes": {"$regex": term, "$options": "i"}},
+                        {"course_details.course_name": {"$regex": term, "$options": "i"}},
+                        {"branch_details.branch_name": {"$regex": term, "$options": "i"}},
+                    ]
+                }
+                if student_ids:
+                    payment_text_q["$or"].append({"student_id": {"$in": student_ids}})
+
+                if filter_query:
+                    filter_query = {"$and": [filter_query, payment_text_q]}
+                else:
+                    filter_query = payment_text_q
 
             # Apply role-based filtering
             managed_branch_ids = None
@@ -793,6 +2197,9 @@ class PaymentController:
                     if not student_id:
                         raise HTTPException(status_code=403, detail="Student ID not found")
                     filter_query["student_id"] = student_id
+                    if not status:
+                        # Hide cancelled attempts from student dashboard by default.
+                        filter_query["payment_status"] = {"$ne": "cancelled"}
                 elif current_role == "branch_manager":
                     # Branch managers can only see payments from their managed branches
                     branch_manager_id = current_user.get("id")
@@ -843,6 +2250,26 @@ class PaymentController:
                     }
                 },
                 {"$replaceRoot": {"newRoot": "$doc"}},  # Replace root with the original document
+                # Resolve branch via enrollment when branch_filter_id is used
+                {
+                    "$lookup": {
+                        "from": "enrollments",
+                        "localField": "enrollment_id",
+                        "foreignField": "id",
+                        "as": "enr",
+                    }
+                },
+                {"$unwind": {"path": "$enr", "preserveNullAndEmptyArrays": True}},
+                {
+                    "$addFields": {
+                        "resolved_branch_id": {"$ifNull": ["$branch_details.branch_id", "$enr.branch_id"]}
+                    }
+                },
+                *(
+                    [{"$match": {"resolved_branch_id": branch_filter_id}}]
+                    if branch_filter_id
+                    else []
+                ),
                 {
                     "$lookup": {
                         "from": "users",
@@ -856,49 +2283,36 @@ class PaymentController:
                     "$project": {
                         "id": 1,
                         "student_id": 1,
+                        "enrollment_id": 1,
                         "student_name": {"$ifNull": ["$student_info.full_name", {"$concat": ["$student_info.first_name", " ", "$student_info.last_name"]}]},
                         "amount": 1,
                         "payment_type": 1,
                         "payment_method": 1,
+                        "gateway_method": 1,
+                        "gateway_payment_label": 1,
+                        "status": 1,
                         "payment_status": 1,
                         "transaction_id": 1,
+                        "razorpay_order_id": 1,
                         "payment_date": 1,
+                        "notes": 1,
                         "course_name": {"$ifNull": ["$course_details.course_name", None]},
                         "branch_name": {"$ifNull": ["$branch_details.branch_name", None]},
-                        "branch_id": {"$ifNull": ["$branch_details.branch_id", None]},
+                        "branch_id": {"$ifNull": ["$branch_details.branch_id", "$resolved_branch_id"]},
                         "created_at": 1
                     }
                 },
                 {"$sort": {"created_at": -1}},
-                {"$skip": skip},
-                {"$limit": limit}
             ]
 
-            payments = await db.payments.aggregate(pipeline).to_list(limit)
+            # IMPORTANT: Fetch wider set first, then dedupe, then paginate.
+            # Paginating before dedupe can hide successful rows behind duplicate pending retries.
+            pre_dedupe_fetch_limit = max(1000, (skip + limit) * 10)
+            payments = await db.payments.aggregate(pipeline).to_list(pre_dedupe_fetch_limit)
 
-            # Convert MongoDB documents to JSON-serializable format and deduplicate
+            # Convert MongoDB documents to JSON-serializable format
             serialized_payments = []
-            seen_payment_ids = set()
-            seen_transaction_ids = set()
-
             for payment in payments:
-                # Skip duplicate payments based on payment ID
-                payment_id = payment.get("id")
-                transaction_id = payment.get("transaction_id")
-
-                if payment_id in seen_payment_ids:
-                    print(f"⚠️ Skipping duplicate payment by ID: {payment_id}")
-                    continue
-
-                # Also check for duplicate transaction IDs (which is what user is seeing)
-                if transaction_id and transaction_id in seen_transaction_ids:
-                    print(f"⚠️ Skipping duplicate payment by transaction ID: {transaction_id}")
-                    continue
-
-                seen_payment_ids.add(payment_id)
-                if transaction_id:
-                    seen_transaction_ids.add(transaction_id)
-
                 # Convert ObjectId and datetime objects to strings
                 serialized_payment = {}
                 for key, value in payment.items():
@@ -910,16 +2324,321 @@ class PaymentController:
                         serialized_payment[key] = value
                 serialized_payments.append(serialized_payment)
 
+            # Strong deduplication by logical payment attempt key.
+            deduped_map: Dict[str, dict] = {}
+            for sp in serialized_payments:
+                key = PaymentController._payment_dedup_key(sp)
+                existing = deduped_map.get(key)
+                deduped_map[key] = sp if existing is None else PaymentController._pick_better_payment(existing, sp)
+            serialized_payments = list(deduped_map.values())
+            serialized_payments.sort(
+                key=lambda p: (
+                    p.get("created_at") or "",
+                    p.get("updated_at") or "",
+                ),
+                reverse=True,
+            )
+            total_after_dedupe = len(serialized_payments)
+            serialized_payments = serialized_payments[skip: skip + limit]
+
+            _METHOD_DISPLAY = {
+                "digital_wallet": "Online (UPI / card / wallet)",
+                "credit_card": "Credit card",
+                "debit_card": "Debit card",
+                "upi": "UPI",
+                "net_banking": "Net banking",
+                "cash": "Cash",
+                "bank_transfer": "Bank transfer",
+            }
+            _GATEWAY_METHOD_DISPLAY = {
+                "upi": "UPI",
+                "card": "Card",
+                "netbanking": "Net Banking",
+                "wallet": "Wallet",
+                "emi": "EMI",
+                "paylater": "Pay Later",
+                "bank_transfer": "Bank transfer",
+                "razorpay": "Razorpay",
+            }
+            _RAW_STATUS_TO_PAYMENT_STATUS = {
+                "success": PaymentStatus.PAID.value,
+                "captured": PaymentStatus.PAID.value,
+                "paid": PaymentStatus.PAID.value,
+                "completed": PaymentStatus.PAID.value,
+                "authorized": PaymentStatus.PROCESSING.value,
+                "processing": PaymentStatus.PROCESSING.value,
+                "initiated": PaymentStatus.PENDING.value,
+                "created": PaymentStatus.PENDING.value,
+                "pending": PaymentStatus.PENDING.value,
+                "failed": PaymentStatus.FAILED.value,
+                "error": PaymentStatus.FAILED.value,
+                "cancelled": PaymentStatus.CANCELLED.value,
+                "canceled": PaymentStatus.CANCELLED.value,
+                "refunded": PaymentStatus.CANCELLED.value,
+            }
+            # Razorpay pay_* ids are not "digital wallet"; older rows may lack gateway_payment_label
+            for sp in serialized_payments:
+                raw_ps = str(sp.get("payment_status") or "").strip().lower()
+                raw_status = str(sp.get("status") or "").strip().lower()
+                if not raw_ps and raw_status:
+                    mapped = _RAW_STATUS_TO_PAYMENT_STATUS.get(raw_status)
+                    if mapped:
+                        sp["payment_status"] = mapped
+                        raw_ps = mapped
+                elif raw_ps == PaymentStatus.PENDING.value and raw_status in {"success", "captured", "paid", "completed"}:
+                    # Keep tracking view truthful when legacy rows have stale payment_status but final status success.
+                    sp["payment_status"] = PaymentStatus.PAID.value
+                    raw_ps = PaymentStatus.PAID.value
+
+                if sp.get("gateway_payment_label"):
+                    continue
+                tid = sp.get("transaction_id") or ""
+                pm = (sp.get("payment_method") or "").lower()
+                gm = (sp.get("gateway_method") or "").lower()
+                if gm:
+                    sp["gateway_payment_label"] = _GATEWAY_METHOD_DISPLAY.get(gm) or gm.replace("_", " ").title()
+                elif str(tid).startswith("pay_") and pm == "digital_wallet":
+                    sp["gateway_payment_label"] = "Razorpay (online)"
+                elif pm:
+                    sp["gateway_payment_label"] = _METHOD_DISPLAY.get(pm) or pm.replace("_", " ").title()
+
+            # Enrich missing course names from enrollment → course (older rows may lack course_details)
+            for sp in serialized_payments:
+                if sp.get("course_name"):
+                    continue
+                eid = sp.get("enrollment_id")
+                if not eid:
+                    continue
+                try:
+                    en = await db.enrollments.find_one({"id": eid})
+                    if not en:
+                        continue
+                    cid = en.get("course_id")
+                    if not cid:
+                        continue
+                    cdoc = await db.courses.find_one({"id": cid})
+                    if cdoc:
+                        sp["course_name"] = cdoc.get("title") or cdoc.get("name")
+                except Exception:
+                    logger.exception("enrich course_name for payment %s", sp.get("id"))
+
             print(f"🔍 Payment query debug - Student ID: {filter_query.get('student_id', 'N/A')}")
             print(f"🔍 Total payments found: {len(payments)}, After deduplication: {len(serialized_payments)}")
 
-            return {"payments": serialized_payments}
+            return {
+                "payments": serialized_payments,
+                "total": total_after_dedupe,
+                "skip": skip,
+                "limit": limit,
+            }
 
         except Exception as e:
             print(f"Error in get_payments: {e}")
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+    @staticmethod
+    async def cancel_payment_attempt(payment_id: str, current_user: dict):
+        """Cancel mistaken/pending payment attempts from admin payment tracking."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        payment = await db.payments.find_one({"id": payment_id})
+        if not payment:
+            raise HTTPException(status_code=404, detail="Payment not found")
+
+        status_lc = str(payment.get("payment_status") or "").strip().lower()
+        if status_lc in {"paid", "completed"}:
+            raise HTTPException(status_code=400, detail="Paid transactions cannot be cancelled")
+        if status_lc in {"cancelled", "canceled"}:
+            return {"message": "Payment attempt already cancelled"}
+
+        now = datetime.utcnow()
+        actor = current_user.get("id") if current_user else None
+        enrollment_id = payment.get("enrollment_id")
+
+        update_filter = {"id": payment_id}
+        update_many_filter = None
+        if enrollment_id:
+            # Cancel duplicate pending attempts created for the same checkout/enrollment.
+            update_many_filter = {
+                "student_id": payment.get("student_id"),
+                "enrollment_id": enrollment_id,
+                "payment_status": {"$in": ["pending", "processing", "failed", "overdue"]},
+            }
+
+        cancel_update = {
+            "$set": {
+                "payment_status": "cancelled",
+                "status": "cancelled",
+                "updated_at": now,
+                "notes": f"Cancelled by super admin ({actor or 'unknown'})",
+            }
+        }
+
+        if update_many_filter:
+            await db.payments.update_many(update_many_filter, cancel_update)
+        else:
+            await db.payments.update_one(update_filter, cancel_update)
+
+        if enrollment_id:
+            has_paid = await db.payments.find_one(
+                {
+                    "enrollment_id": enrollment_id,
+                    "payment_status": {"$in": ["paid", "completed"]},
+                }
+            )
+            if not has_paid:
+                await db.enrollments.update_one(
+                    {"id": enrollment_id, "payment_status": {"$in": ["pending", "processing", "failed"]}},
+                    {
+                        "$set": {
+                            "payment_status": "cancelled",
+                            "status": "cancelled",
+                            "is_active": False,
+                            "updated_at": now,
+                        }
+                    },
+                )
+
+        return {"message": "Payment attempt cancelled successfully"}
+
+    @staticmethod
+    async def recover_cancelled_payment_attempt(
+        payment_id: str,
+        body: AdminPaymentRecoveryBody,
+        current_user: dict,
+    ):
+        """
+        Undo admin cancellation: restore pending checkout, or mark as paid / waived (super admin only).
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        payment = await db.payments.find_one({"id": payment_id})
+        if not payment:
+            raise HTTPException(status_code=404, detail="Payment not found")
+
+        status_lc = str(payment.get("payment_status") or "").strip().lower()
+        if status_lc not in {"cancelled", "canceled"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Only cancelled payment rows can be recovered",
+            )
+
+        enrollment_id = payment.get("enrollment_id")
+        if not enrollment_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment has no enrollment link; cannot recover",
+            )
+
+        if not await db.enrollments.find_one({"id": enrollment_id}):
+            raise HTTPException(status_code=404, detail="Enrollment not found")
+
+        now = datetime.utcnow()
+        actor = current_user.get("id") if current_user else None
+        actor_label = str(actor or "unknown")
+
+        other_paid = await db.payments.find_one(
+            {
+                "enrollment_id": enrollment_id,
+                "id": {"$ne": payment_id},
+                "payment_status": {"$in": ["paid", "completed"]},
+            }
+        )
+        if other_paid and body.action in {"mark_received", "waive"}:
+            raise HTTPException(
+                status_code=400,
+                detail="This enrollment already has another paid payment; resolve that record first.",
+            )
+
+        if body.action == "restore_checkout":
+            if other_paid:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This enrollment already has a paid payment; use a different recovery action or reconcile data.",
+                )
+            note = (body.note or "").strip()
+            note_suffix = f" {note}" if note else ""
+            await db.payments.update_one(
+                {"id": payment_id},
+                {
+                    "$set": {
+                        "payment_status": PaymentStatus.PENDING.value,
+                        "status": "initiated",
+                        "updated_at": now,
+                        "notes": f"Restored to pending checkout by admin ({actor_label}){note_suffix}".strip(),
+                        "payment_date": None,
+                        "transaction_id": None,
+                    },
+                    "$unset": {
+                        "razorpay_payment_id": "",
+                        "razorpay_order_id": "",
+                    },
+                },
+            )
+            await db.enrollments.update_one(
+                {"id": enrollment_id},
+                {
+                    "$set": {
+                        "payment_status": EnrollmentPaymentStatus.PENDING.value,
+                        "is_active": True,
+                        "updated_at": now,
+                    },
+                    "$unset": {"status": "", "razorpay_last_order_id": ""},
+                },
+            )
+            return {"message": "Enrollment restored to pending checkout; student can pay again."}
+
+        # mark_received or waive — activate enrollment as paid on this row
+        extra = (body.note or "").strip()
+        if body.action == "waive":
+            pm_label = "waived"
+            base_note = f"Complimentary / waived by admin ({actor_label})"
+            notes = f"{base_note}. {extra}" if extra else base_note
+            txn = f"WAIVE-{uuid.uuid4().hex[:16].upper()}"
+        else:
+            pm_label = PaymentMethod.CASH.value
+            base_note = f"Marked received by admin ({actor_label})"
+            notes = f"{base_note}. {extra}" if extra else base_note
+            txn = f"MANUAL-{uuid.uuid4().hex[:16].upper()}"
+
+        await db.payments.update_one(
+            {"id": payment_id},
+            {
+                "$set": {
+                    "payment_status": PaymentStatus.PAID.value,
+                    "status": "success",
+                    "payment_method": pm_label,
+                    "updated_at": now,
+                    "payment_date": now,
+                    "transaction_id": txn,
+                    "notes": notes,
+                },
+                "$unset": {
+                    "razorpay_payment_id": "",
+                    "razorpay_order_id": "",
+                },
+            },
+        )
+        await db.enrollments.update_one(
+            {"id": enrollment_id},
+            {
+                "$set": {
+                    "payment_status": EnrollmentPaymentStatus.PAID.value,
+                    "is_active": True,
+                    "updated_at": now,
+                },
+                "$unset": {"status": ""},
+            },
+        )
+        if body.action == "waive":
+            return {"message": "Course marked complimentary; enrollment is active."}
+        return {"message": "Payment marked received; enrollment is active."}
 
     @staticmethod
     async def export_payments(
