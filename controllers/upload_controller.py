@@ -10,12 +10,11 @@ from fastapi import HTTPException, UploadFile
 # UPLOAD_ROOT=/Users/you/Documents/Projects/rockmartialarts/rockmartialarts-fe/public/uploads
 def _default_upload_root() -> Path:
     """
-    Prefer local workspace Next.js public/uploads when running from the monorepo.
-    Fallback to production default when not available.
+    Prefer sibling rockmartialarts-fe/public/uploads next to rockmartialarts-be.
+    Fallback to production deploy path when monorepo layout is absent.
     """
-    # repo layout: <repo>/rockmartialarts-be/controllers/upload_controller.py
-    repo_root = Path(__file__).resolve().parents[2].parent  # .../rockmartialarts
-    local_public = repo_root / "rockmartialarts-fe" / "public" / "uploads"
+    be_root = Path(__file__).resolve().parents[1]  # .../rockmartialarts-be
+    local_public = be_root.parent / "rockmartialarts-fe" / "public" / "uploads"
     if local_public.parent.exists():
         return local_public
     return Path("/var/www/rockmartialarts-fe/public/uploads")

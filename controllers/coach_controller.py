@@ -374,7 +374,7 @@ class CoachController:
         if coach_update.is_active is not None:  # ✅ add this
             update_data["is_active"] = coach_update.is_active
 
-        patch = coach_update.dict(exclude_unset=True)
+        patch = coach_update.model_dump(exclude_unset=True)
         if "profile_image_url" in patch:
             update_data["profile_image_url"] = patch["profile_image_url"]
         if "about_short" in patch:

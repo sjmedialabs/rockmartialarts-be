@@ -340,10 +340,12 @@ class CourseController:
                 continue
 
             # Get instructor assignments (coaches assigned to this course)
-            # Query coaches collection for coaches assigned to this specific course
             instructors = await db.coaches.find({
-                "assignment_details.courses": course["id"],
-                "is_active": True
+                "is_active": True,
+                "$or": [
+                    {"assignment_details.courses": course["id"]},
+                    {"areas_of_expertise": course["id"]},
+                ],
             }).to_list(length=100)
 
             # Get student enrollment count
@@ -462,9 +464,12 @@ class CourseController:
             for course in courses:
                 # Get instructor assignments (coaches assigned to this course at this branch)
                 instructors = await db.coaches.find({
-                    "assignment_details.courses": course["id"],
                     "branch_id": branch_id,
-                    "is_active": True
+                    "is_active": True,
+                    "$or": [
+                        {"assignment_details.courses": course["id"]},
+                        {"areas_of_expertise": course["id"]},
+                    ],
                 }).to_list(length=100)
 
                 # Get student enrollment count for this course at this branch
@@ -748,10 +753,12 @@ class CourseController:
             }).to_list(length=100)
 
             # Get instructor assignments (coaches assigned to this course)
-            # Query coaches collection for coaches assigned to this specific course
             instructors = await db.coaches.find({
-                "assignment_details.courses": course["id"],
-                "is_active": True
+                "is_active": True,
+                "$or": [
+                    {"assignment_details.courses": course["id"]},
+                    {"areas_of_expertise": course["id"]},
+                ],
             }).to_list(length=100)
 
             # Get student enrollment count
@@ -827,8 +834,11 @@ class CourseController:
             "is_active": True
         }).to_list(length=100)
         instructors = await db.coaches.find({
-            "assignment_details.courses": course_id,
-            "is_active": True
+            "is_active": True,
+            "$or": [
+                {"assignment_details.courses": course_id},
+                {"areas_of_expertise": course_id},
+            ],
         }).to_list(length=100)
         enrollment_count = await db.enrollments.count_documents({
             "course_id": course_id,
@@ -901,6 +911,21 @@ class CourseController:
             for b in branches
         ]
 
+        assigned_coaches = []
+        for instructor in instructors:
+            prof = instructor.get("professional_info") or {}
+            contact = instructor.get("contact_info") or {}
+            assigned_coaches.append({
+                "id": instructor.get("id"),
+                "name": instructor.get("full_name")
+                or f"{instructor.get('first_name', '')} {instructor.get('last_name', '')}".strip()
+                or "Coach",
+                "designation": prof.get("designation_id") or "Coach",
+                "bio": instructor.get("about_short") or "",
+                "photo": instructor.get("profile_image_url") or "",
+                "email": instructor.get("email") or contact.get("email") or "",
+            })
+
         serialized_course = serialize_doc(course)
         CourseController._attach_public_about_fields(serialized_course)
         serialized_course.pop("description", None)
@@ -914,6 +939,8 @@ class CourseController:
             "student_achievements": student_achievements,
             "showcase_achievements": showcase_achievements,
             "branches_offering": branches_offering,
+            "assigned_coaches": assigned_coaches,
+            "instructor_assignments": assigned_coaches,
         }
 
     @staticmethod
