@@ -346,6 +346,8 @@ class BranchController:
             }
         }
 
+        await _enrich_course_schedule_trainers(db, branch_with_stats)
+
         return serialize_doc(branch_with_stats)
 
     @staticmethod

@@ -39,6 +39,7 @@ class DropdownSettingsController:
             {"value": "Australia", "label": "Australia", "is_active": True, "order": 5},
         ],
         "designations": [
+            {"value": "Founder", "label": "Founder", "is_active": True, "order": 0},
             {"value": "Senior Coach", "label": "Senior Coach", "is_active": True, "order": 1},
             {"value": "Coach Instructor", "label": "Coach Instructor", "is_active": True, "order": 2},
             {"value": "Senior Instructor", "label": "Senior Instructor", "is_active": True, "order": 3},

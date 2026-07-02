@@ -101,6 +101,8 @@ async def get_current_user_or_superadmin(credentials: HTTPAuthorizationCredentia
     db = get_db()
     try:
         return await _resolve_user_from_token(db, credentials.credentials)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
 

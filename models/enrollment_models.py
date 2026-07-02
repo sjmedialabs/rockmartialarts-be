@@ -30,6 +30,7 @@ class Enrollment(BaseModel):
     next_due_date: Optional[datetime] = None
     is_active: bool = True
     duration_id: Optional[str] = None
+    batch_ref: Optional[str] = None
     beneficiary: Optional[BeneficiaryInfo] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 

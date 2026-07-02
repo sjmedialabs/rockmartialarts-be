@@ -464,6 +464,33 @@ class UserController:
         }
 
     @staticmethod
+    async def _resolve_enrollment_course_fee(
+        user_id: str,
+        course_id: str,
+        branch_id: str,
+        duration_ref: Optional[str],
+        batch_ref: Optional[str] = None,
+    ) -> Optional[float]:
+        """Course fee for enrollment/renewal using batch-aware pricing (no admission)."""
+        if not course_id or not branch_id or not duration_ref:
+            return None
+        try:
+            from controllers.payment_controller import PaymentController
+
+            info = await PaymentController.get_course_payment_info(
+                course_id,
+                branch_id,
+                duration_ref,
+                batch_ref=(batch_ref or None),
+                optional_student_id=user_id,
+            )
+            fee = info.pricing.course_fee
+            return float(fee) if fee is not None else None
+        except Exception as exc:
+            print(f"⚠️ Could not resolve enrollment course fee: {exc}")
+            return None
+
+    @staticmethod
     async def handle_enrollment_updates(user_id: str, course_data: dict, branch_data: dict):
         """Handle enrollment record updates when course/branch data changes"""
         db = get_db()
@@ -484,27 +511,44 @@ class UserController:
 
             if course_data:
                 course_id = course_data.get("course_id")
+                duration_ref = course_data.get("duration")
+                batch_ref = (course_data.get("batch_ref") or "").strip() or None
                 if course_id:
+                    fee_amount = await UserController._resolve_enrollment_course_fee(
+                        user_id,
+                        course_id,
+                        branch_id,
+                        duration_ref,
+                        batch_ref=batch_ref,
+                    )
+
                     existing_enrollment = None
                     for enrollment in existing_enrollments:
                         if enrollment.get("course_id") == course_id:
                             existing_enrollment = enrollment
                             break
 
+                    enrollment_patch: Dict[str, Any] = {
+                        "branch_id": branch_id,
+                        "updated_at": datetime.utcnow(),
+                        "is_active": True,
+                    }
+                    if duration_ref:
+                        enrollment_patch["duration_id"] = duration_ref
+                    if batch_ref:
+                        enrollment_patch["batch_ref"] = batch_ref
+                    if fee_amount is not None:
+                        enrollment_patch["fee_amount"] = fee_amount
+
                     if existing_enrollment:
                         await db.enrollments.update_one(
                             {"id": existing_enrollment["id"]},
-                            {"$set": {
-                                "branch_id": branch_id,
-                                "updated_at": datetime.utcnow(),
-                                "is_active": True
-                            }}
+                            {"$set": enrollment_patch}
                         )
                         print(f"✅ Updated existing enrollment branch: {existing_enrollment['id']}")
                     else:
                         from models.enrollment_models import Enrollment, PaymentStatus
 
-                        duration_ref = course_data.get("duration")
                         start_date = datetime.utcnow()
                         end_date = await resolve_enrollment_end_date(
                             db, duration_ref, start_date
@@ -516,11 +560,12 @@ class UserController:
                             branch_id=branch_id,
                             start_date=start_date,
                             end_date=end_date,
-                            fee_amount=0.0,
+                            fee_amount=fee_amount if fee_amount is not None else 0.0,
                             admission_fee=0.0,
                             payment_status=PaymentStatus.PENDING,
                             enrollment_date=start_date,
-                            is_active=True
+                            is_active=True,
+                            batch_ref=batch_ref,
                         )
 
                         enrollment_doc = enrollment.dict()

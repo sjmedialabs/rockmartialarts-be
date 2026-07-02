@@ -17,6 +17,7 @@ class CourseInfo(BaseModel):
     category_id: str
     course_id: str
     duration: str
+    batch_ref: Optional[str] = None
 
 class BranchInfo(BaseModel):
     location_id: str

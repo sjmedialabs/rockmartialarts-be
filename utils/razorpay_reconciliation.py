@@ -279,6 +279,8 @@ async def reconcile_one_payment_row(
     if not payment_row:
         return {"updated": False, "reason": "missing_row"}
 
+    now = _now()
+
     pid = str(payment_row.get("id") or "").strip()
     if not pid:
         pid = str(payment_row.get("_id") or "").strip()
@@ -344,7 +346,6 @@ async def reconcile_one_payment_row(
         norm.get("razorpay_amount_paise"),
     )
 
-    now = _now()
     update = {
         **norm,
         "payment_status": mapped["payment_status"],

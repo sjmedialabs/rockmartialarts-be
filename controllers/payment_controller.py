@@ -39,6 +39,7 @@ from controllers.settings_controller import SettingsController
 from utils.razorpay_client import get_razorpay_client, verify_razorpay_signature
 from utils.razorpay_reconciliation import (
     ensure_collections_indexes,
+    fetch_order,
     get_last_reconciled_at,
     reconcile_payments_batch,
     reconcile_one_payment_row,
@@ -173,6 +174,68 @@ def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
     if v < 0:
         return None
     return v
+
+
+def _validate_razorpay_captured_amount(
+    *,
+    enrollment_expected_paise: int,
+    order_id: Optional[str],
+    payment_entity: dict,
+    enrollment_id: str,
+) -> None:
+    """
+    Ensure a captured Razorpay payment matches the enrollment checkout order.
+
+    When convenience/gateway fees are passed to the customer, payment.amount exceeds
+    order.amount; compare against the Razorpay order amount instead of payment.amount.
+    """
+    pay_amount = payment_entity.get("amount")
+    if pay_amount is None:
+        return
+
+    pay_paise = int(pay_amount)
+    order_paise = enrollment_expected_paise
+    if order_id:
+        pay_order_id = str(payment_entity.get("order_id") or "").strip()
+        if pay_order_id and pay_order_id != order_id:
+            logger.error(
+                "Razorpay payment order mismatch enrollment=%s expected_order=%s payment_order=%s",
+                enrollment_id,
+                order_id,
+                pay_order_id,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Payment does not match this checkout order. Please contact support.",
+            )
+        rz_order = fetch_order(order_id)
+        if rz_order and rz_order.get("amount") is not None:
+            order_paise = int(rz_order["amount"])
+
+    if order_paise != enrollment_expected_paise:
+        logger.error(
+            "Razorpay order amount mismatch enrollment=%s expected_paise=%s order_amount=%s order_id=%s",
+            enrollment_id,
+            enrollment_expected_paise,
+            order_paise,
+            order_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Payment amount does not match enrollment. Please contact support.",
+        )
+
+    if pay_paise < order_paise:
+        logger.error(
+            "Razorpay underpayment enrollment=%s order_paise=%s payment_amount=%s",
+            enrollment_id,
+            order_paise,
+            pay_paise,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Payment amount is less than the order total. Please contact support.",
+        )
 
 
 def _fetch_razorpay_payment_entity(payment_id: str) -> Optional[dict]:
@@ -767,20 +830,13 @@ class PaymentController:
         if rz:
             pm_value, gw_raw, gw_label = _razorpay_method_to_payment_fields(rz)
             if data.razorpay_order_id:
-                rz_amount = rz.get("amount")
-                if rz_amount is not None:
-                    expected_paise = int(round(expected_total_inr * 100))
-                    if int(rz_amount) != expected_paise:
-                        logger.error(
-                            "Razorpay captured amount mismatch enrollment=%s expected_paise=%s payment_amount=%s",
-                            data.enrollment_id,
-                            expected_paise,
-                            rz_amount,
-                        )
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Payment amount does not match enrollment. Please contact support.",
-                        )
+                expected_paise = int(round(expected_total_inr * 100))
+                _validate_razorpay_captured_amount(
+                    enrollment_expected_paise=expected_paise,
+                    order_id=data.razorpay_order_id,
+                    payment_entity=rz,
+                    enrollment_id=data.enrollment_id,
+                )
 
         # Idempotency: if this Razorpay payment is already recorded, just ensure enrollment is active/paid.
         existing_paid = await db.payments.find_one(
@@ -1686,15 +1742,25 @@ class PaymentController:
     def _payment_stats_parse_period(
         start_date: Optional[str], end_date: Optional[str]
     ):
-        if not start_date or not end_date:
+        if not start_date and not end_date:
             return None, None
         try:
-            s = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+            if start_date and end_date:
+                s = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+                e = datetime.strptime(str(end_date)[:10], "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, microsecond=999999
+                )
+                if s > e:
+                    s, e = e, s
+                return s, e
+            if start_date:
+                s = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+                e = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
+                return s, e
             e = datetime.strptime(str(end_date)[:10], "%Y-%m-%d").replace(
                 hour=23, minute=59, second=59, microsecond=999999
             )
-            if s > e:
-                s, e = e, s
+            s = datetime(1970, 1, 1)
             return s, e
         except (ValueError, TypeError):
             return None, None
